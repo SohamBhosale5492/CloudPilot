@@ -16,7 +16,7 @@ Platform engineers, SREs, DevOps engineers, and service owners.
 2. Discover supported source and deployment artifacts.
 3. Build a normalized service/dependency model.
 4. Inspect supported configuration and, when explicitly configured, query telemetry through read-only adapters.
-5. Compare expected and observed state with versioned deterministic rules.
+5. Compare expected and observed state with versioned deterministic rules and versioned CloudPilot policies/service templates.
 6. Explain each finding with evidence, scope, severity, and limitations.
 7. Generate a minimal supported patch when a safe fix is known.
 8. Open a branch/pull request for authorized human review.
@@ -46,6 +46,8 @@ Unrestricted autonomous production changes; arbitrary generated shell execution;
 
 ## Finding contract
 A finding should contain stable ID, rule ID/version, project/service/resource, severity, title/explanation, expected state, observed state, evidence references/timestamps, limitations, optional remediation/risk classification, lifecycle state, and verification result.
+
+Evidence outcomes are `pass`, `gap`, `unknown`, and `inconclusive`. A `gap` requires sufficient evidence to establish that a requirement is violated. Missing telemetry is not automatically a gap; it is `unknown` or `inconclusive` depending on whether evidence is unavailable or insufficiently clear.
 
 ## Remediation states
 `detected → triaged → proposed → pull_request_open → approved → checks_passed → applied → verification_pending → verified`

@@ -10,8 +10,8 @@ Start as a modular monolith with explicit boundaries. Add background jobs when n
 - API/application layer: authentication context, authorization, validation, orchestration, pagination.
 - Repository connector: scoped GitHub operations.
 - Discovery/parser: safely parses supported manifests/configuration.
-- Service model: normalized services, dependencies, environments and expected requirements.
-- Rule engine: deterministic, versioned comparison rules.
+- Service model: normalized services, dependencies, environments and expected requirements from versioned CloudPilot policies and service templates.
+- Rule engine: deterministic, versioned comparison rules that classify outcomes as `pass`, `gap`, `unknown` or `inconclusive`.
 - Telemetry adapters: read-only queries to supported telemetry backends.
 - Remediation planner: minimal supported patch generation; no arbitrary command execution.
 - Policy/approval: permissions, checks, environment restrictions and approval records.
@@ -22,6 +22,14 @@ Start as a modular monolith with explicit boundaries. Add background jobs when n
 ## Data flow
 `UI → API → scan orchestration → discovery → normalized model → read-only telemetry inspection → rule engine → findings`
 Remediation: `finding → planner → patch validation → Git branch/PR → human approval + required checks → existing CI/CD → deployment → verification → audit/history`
+
+## Evidence outcomes
+- `pass`: sufficient evidence shows the requirement is satisfied.
+- `gap`: sufficient evidence shows a requirement is violated.
+- `unknown`: required evidence is unavailable, unsupported or not configured.
+- `inconclusive`: evidence exists but is ambiguous, stale, incomplete or outside the configured verification window.
+
+Missing telemetry is not automatically a gap. Verification uses configurable observation windows and rule-specific success criteria.
 
 ## Trust boundaries
 1. Browser/API: authentication, authorization, validation, rate limits.
@@ -39,7 +47,7 @@ Tenant, User/IdentityMapping, Project, RepositoryConnection, Environment, Servic
 Version APIs (e.g. `/api/v1`); validate inputs; use consistent errors and correlation IDs; paginate; authorize every scoped operation; make long scans asynchronous; define idempotency; redact secrets. Use structured logs, health/readiness endpoints, bounded retries, timeouts, resource limits, migrations, backups and restore tests.
 
 ## Initial deployment
-Local Docker Compose: frontend, API, PostgreSQL, demo services, OpenTelemetry Collector and Prometheus. First cloud target: Azure AKS with Helm/Terraform and managed/workload identity where supported.
+Local Docker Compose: frontend, API, PostgreSQL, demo services, OpenTelemetry Collector, Prometheus and one compatible trace backend selected during Phase 01. First cloud target: Azure AKS with Helm/Terraform and managed/workload identity where supported.
 
 ## Open decisions
-Authentication provider, tenant isolation and row-level security, job queue, local logs/traces backend, GitHub App model and minimum scopes, source of expected observability requirements, verification evidence windows and inconclusive thresholds, policy engine, audit integrity/retention, AI provider/data boundary.
+Authentication provider, database row-level security mechanism, exact job/worker implementation, Phase 01 trace backend, production audit retention/integrity controls, AI provider/model and data-boundary configuration.

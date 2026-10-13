@@ -22,8 +22,10 @@ A phase is complete only when acceptance evidence exists and the completion repo
 ## Phase 00 completion checklist
 - The repository is initialized and the foundation documents are tracked.
 - The six foundation documents agree on scope, safety boundaries, and phase ordering.
-- Open architecture/product/security decisions are explicit in `docs/DECISIONS.md`.
+- Architecture/product/security decisions are reviewed in `docs/DECISIONS.md`, with deferred choices explicit.
 - No document claims implemented behavior, benchmark results, production readiness, or external endorsement.
 - Security assumptions, trust boundaries, and least-privilege controls are recorded before feature implementation starts.
+- No application code is generated in Phase 00.
+- `git status --short` is clean after the final Phase 00 documentation commit.
 
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
