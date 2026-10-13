@@ -19,17 +19,18 @@ export interface MetricSample {
     statusCode?: string;
   };
   /**
-   * Synthetic fixture count for this distinct metric time series over the
-   * evidence collection window. All samples in one TelemetryEvidence object
-   * represent the same collection window. Distinct series have disjoint counts
-   * and may be summed; duplicate observations of one series are not additive.
-   * This contract is intentionally narrower than arbitrary Prometheus samples.
+   * Count for this distinct metric time series over the evidence collection
+   * window. All samples in one TelemetryEvidence object represent the same
+   * collection window. Distinct series have disjoint counts and may be summed;
+   * duplicate observations of one series are not additive. Prometheus evidence
+   * must be normalized from a compatible range calculation such as increase()
+   * before entering this evaluator.
    */
   value: number;
 }
 
 export interface TelemetryEvidence {
-  source: "synthetic-fixture";
+  source: "synthetic-fixture" | "prometheus";
   collectedAt: string;
   available: boolean;
   complete: boolean;
@@ -129,12 +130,12 @@ export function evaluateRequestMetricRequirement(input: EvaluationInput): Findin
     };
   }
 
-  if (!isObject(evidence) || evidence.source !== "synthetic-fixture") {
+  if (!isObject(evidence) || !isSupportedEvidenceSource(evidence.source)) {
     return {
       ...baseFinding,
       outcome: "inconclusive",
       observed: "Telemetry evidence source is unsupported or malformed.",
-      reason: "Only synthetic-fixture evidence is supported by this evaluator."
+      reason: "Evidence source must be synthetic-fixture or prometheus."
     };
   }
 
@@ -283,6 +284,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function isSupportedEvidenceSource(value: unknown): value is TelemetryEvidence["source"] {
+  return value === "synthetic-fixture" || value === "prometheus";
 }
 
 function isValidSampleShape(sample: MetricSample): boolean {

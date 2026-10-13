@@ -490,6 +490,27 @@ test("reports unsupported extra sample labels as malformed evidence", () => {
   assert.match(finding.reason, /Malformed evidence/);
 });
 
+test("accepts Prometheus evidence source", () => {
+  const finding = evaluate({
+    evidence: completeEvidence({
+      source: "prometheus",
+      samples: [
+        {
+          metricName: "demo_http_server_requests_total",
+          labels: {
+            serviceName: "demo-service",
+            route: "/api/demo",
+            method: "GET"
+          },
+          value: 1
+        }
+      ]
+    })
+  });
+
+  assert.equal(finding.outcome, "pass");
+});
+
 test("reports invalid evidence source as inconclusive", () => {
   const finding = evaluate({
     evidence: {
@@ -499,7 +520,7 @@ test("reports invalid evidence source as inconclusive", () => {
   });
 
   assert.equal(finding.outcome, "inconclusive");
-  assert.match(finding.reason, /Only synthetic-fixture evidence/);
+  assert.match(finding.reason, /synthetic-fixture or prometheus/);
 });
 
 test("reports malformed sample labels as inconclusive", () => {
