@@ -1,0 +1,60 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.kubeconfig
+credentials.*
+secrets.*
+
+# Dependency directories
+node_modules/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# Build and generated output
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+.turbo/
+.vite/
+.next/
+.parcel-cache/
+
+# Logs and runtime output
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local database and cache files
+*.sqlite
+*.sqlite3
+*.db
+.cache/
+tmp/
+temp/
+
+# Local IDE/editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

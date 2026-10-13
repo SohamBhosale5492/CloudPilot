@@ -1,0 +1,107 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -5,5 +5,5 @@ CloudPilot is a continuous observability consistency assurance platform for cloud
+ **Current status:** Phase 00 foundation draft. Documentation is not implementation.
+ 
+-Read `docs/PROJECT_BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/THREAT_MODEL.md`, and `docs/DECISIONS.md`.
++This Phase 00 foundation consists of six review documents: this README, `docs/PROJECT_BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/THREAT_MODEL.md`, and `docs/DECISIONS.md`.
+ 
+-Initial scope: Kubernetes workloads, OpenTelemetry, Prometheus, GitHub pull requests, GitHub Actions, and Azure AKS. Core analysis should avoid unnecessary cloud-provider coupling. Deterministic rules own gap detection. Production-impacting changes require explicit authorization and policy checks.
++Initial product scope: Kubernetes workloads, OpenTelemetry, Prometheus, GitHub pull requests, GitHub Actions, and Azure AKS as the first cloud target. Phase 00 is documentation only; local behavior should be validated before cloud deployment work begins. Core analysis should avoid unnecessary cloud-provider coupling. Deterministic rules own gap detection. Production-impacting changes require explicit authorization and policy checks.
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -18,5 +18,12 @@ A phase is complete only when acceptance evidence exists and the completion repor
+ | 11 | Hardening | Security tests, dependency checks, secret scanning, tenant isolation, recovery exercises |
+ | 12 | Azure AKS | Reproducible infrastructure, identity/network validation, deployment and rollback docs |
+ | 13 | Evaluation/release | Benchmarks, seeded-fault experiments, test report, threat review, docs and reproducible demo |
+ 
++## Phase 00 completion checklist
++- The repository is initialized and the foundation documents are tracked.
++- The six foundation documents agree on scope, safety boundaries, and phase ordering.
++- Open architecture/product/security decisions are explicit in `docs/DECISIONS.md`.
++- No document claims implemented behavior, benchmark results, production readiness, or external endorsement.
++- Security assumptions, trust boundaries, and least-privilege controls are recorded before feature implementation starts.
++
+ Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
+diff --git a/docs/THREAT_MODEL.md b/docs/THREAT_MODEL.md
+--- a/docs/THREAT_MODEL.md
++++ b/docs/THREAT_MODEL.md
+@@ -16,6 +16,7 @@ Repository files, PR comments, telemetry, and external API responses can be malic
+ | Malicious manifests/parser exploit | Safe parser, allowlisted formats, size/depth/time limits, no script execution |
+ | Prompt injection in repo/telemetry | Treat content as data; model cannot grant permissions or bypass policy |
++| Sensitive data exposure to AI/provider tools | Define provider, retention, logging, and data-minimization boundaries before sending repository, telemetry, tenant or credential-adjacent data to any model |
+ | Unsafe generated patch | Allowlisted paths, bounded diff, patch validation, human review and CI |
+ | Unauthorized deployment | Server-side RBAC, protected environments, required reviewers/checks, deny by default |
+ | Cross-tenant access | Per-request authorization, tenant-scoped queries and negative tests |
+ | Telemetry injection/oversized payload | Escaping, payload/query limits, safe rendering |
+@@ -31,7 +32,8 @@ Repository files, PR comments, telemetry, and external API responses can be malic
+ 4. Production-impacting operations require recorded authorized approval.
+ 5. Findings/remediations reference evidence and rule/policy versions.
+ 6. Missing evidence is never silently treated as success.
+ 7. Tenant/project authorization is checked server-side for every scoped operation.
++8. Repository, telemetry, tenant and audit data sent to external processors follows an explicit approved data-boundary decision.
+ 
+ ## Residual risks
+-External CI misconfiguration, incorrect/incomplete rules, compromised authorized users/identities, telemetry privacy/cost, and changing provider APIs require ongoing review.
++External CI misconfiguration, incorrect/incomplete rules, compromised authorized users/identities, telemetry privacy/cost, AI/provider data handling, and changing provider APIs require ongoing review.
+diff --git a/docs/DECISIONS.md b/docs/DECISIONS.md
+--- a/docs/DECISIONS.md
++++ b/docs/DECISIONS.md
+@@ -5,38 +5,47 @@ Append decisions with date, status, context, alternatives, consequences and revie
+ ## D-001: Modular monolith first
++- **Date:** 2026-10-13
+ - **Status:** Proposed for review
+ - **Decision:** Start with explicit module boundaries in one deployable backend.
+ - **Context:** Early development needs simple deployment; no measured need for multiple services.
+ - **Alternative:** Microservices from day one.
+ - **Consequence:** Simpler development; boundaries must be maintained.
+ - **Review trigger:** Measured scaling, isolation, reliability or deployment needs justify splitting.
+ 
+ ## D-002: Deterministic rules own gap detection
++- **Date:** 2026-10-13
+ - **Status:** Proposed for review
+ - **Decision:** Versioned deterministic rules are the source of truth for gap existence.
+ - **Context:** Findings must be reproducible and explainable.
+ - **Alternative:** LLM decides findings directly.
+ - **Consequence:** Rule maintenance required; AI may assist with explanations/fixes but not policy outcomes.
+ - **Review trigger:** Evidence shows bounded AI assistance improves outcomes without reducing safety.
+ 
+ ## D-003: Pull requests for remediation
++- **Date:** 2026-10-13
+ - **Status:** Proposed for review
+ - **Decision:** Source changes go through branch, PR, required checks and authorized review.
++- **Context:** Remediation must be reviewable, auditable, reversible and compatible with existing repository policies.
+ - **Alternative:** Direct application mutation.
+ - **Consequence:** Reviewability and traceability; deployment still needs runtime verification.
+ - **Review trigger:** A supported remediation cannot reasonably be represented as a repository change.
+ 
+ ## D-004: Azure AKS initial target
++- **Date:** 2026-10-13
+ - **Status:** Proposed for review
+ - **Decision:** Azure AKS is the first cloud target; core domain logic remains provider-agnostic where practical.
++- **Context:** The project needs one concrete cloud deployment path for validation without making provider-specific behavior the core model.
+ - **Alternative:** Multi-cloud deployment simultaneously.
+ - **Consequence:** Azure adapters exist but should not leak into core domain types.
+ - **Review trigger:** Validated demand for another provider.
+ 
+ ## D-005: TypeScript/React/PostgreSQL/Prisma baseline
++- **Date:** 2026-10-13
+ - **Status:** Proposed for review
+ - **Decision:** TypeScript backend/frontend, React + Vite UI, PostgreSQL persistence, Prisma migrations.
++- **Context:** A shared typed stack should reduce early integration overhead across API, UI and persistence.
++- **Alternative:** Polyglot services, a different frontend framework, or a different persistence/migration stack.
+ - **Consequence:** Consistent language and typed contracts; requires migration discipline.
+ - **Review trigger:** Demonstrated requirements exceed this baseline.
+ 
+ ## Open decisions
+-Authentication/session model; tenant isolation and row-level security; GitHub App permissions; job queue; local logs/traces backend; policy engine; audit retention/integrity; AI provider and data boundaries.
++Authentication/session model; tenant isolation and row-level security; GitHub App permissions and exact minimum scopes; source of expected observability requirements; verification evidence windows and inconclusive thresholds; job queue; local logs/traces backend; policy engine; audit retention/integrity; AI provider and data boundaries.
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -44,2 +44,2 @@ Local Docker Compose: frontend, API, PostgreSQL, demo services, OpenTelemetry Co
+ ## Open decisions
+-Authentication provider, tenant isolation and row-level security, job queue, local logs/traces backend, GitHub App model, policy engine, audit integrity/retention.
++Authentication provider, tenant isolation and row-level security, job queue, local logs/traces backend, GitHub App model and minimum scopes, source of expected observability requirements, verification evidence windows and inconclusive thresholds, policy engine, audit integrity/retention, AI provider/data boundary.
