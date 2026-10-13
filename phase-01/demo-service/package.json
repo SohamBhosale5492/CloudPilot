@@ -19,7 +19,8 @@
     "@opentelemetry/instrumentation-http": "0.222.0",
     "@opentelemetry/resources": "2.10.0",
     "@opentelemetry/sdk-metrics": "2.10.0",
-    "@opentelemetry/sdk-node": "0.223.0"
+    "@opentelemetry/sdk-node": "0.223.0",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@types/node": "22.13.14",

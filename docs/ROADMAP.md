@@ -28,4 +28,9 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - No application code is generated in Phase 00.
 - `git status --short` is clean after the final Phase 00 documentation commit.
 
+## Phase 02 implementation notes
+- Initial architecture discovery supports a bounded allowlist of Docker Compose and Kubernetes YAML.
+- The normalized model and diagnostic contracts are documented in `phase-02/README.md`.
+- Phase 02 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
