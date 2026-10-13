@@ -33,4 +33,9 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - The normalized model and diagnostic contracts are documented in `phase-02/README.md`.
 - Phase 02 remains pending human review and is not marked complete by this note.
 
+## Phase 03 implementation notes
+- Defines a versioned expected-observability requirements model for metrics, logs, traces, health checks, and alerts.
+- The model contract, examples, and limitations are documented in `phase-03/README.md`.
+- Phase 03 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
