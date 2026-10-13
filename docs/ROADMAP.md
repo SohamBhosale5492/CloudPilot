@@ -38,4 +38,9 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - The model contract, examples, and limitations are documented in `phase-03/README.md`.
 - Phase 03 remains pending human review and is not marked complete by this note.
 
+## Phase 04 implementation notes
+- Read-only inspectors return typed, provenance-aware evidence with explicit available, complete, and diagnostic states.
+- The inspector contracts, adapters, and limitations are documented in `phase-04/README.md`.
+- Phase 04 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
