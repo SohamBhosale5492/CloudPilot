@@ -15,6 +15,7 @@ Repository files, PR comments, telemetry, and external API responses can be mali
 | Secret leakage | Secret manager, redaction, tests against logs and responses |
 | Malicious manifests/parser exploit | Safe parser, allowlisted formats, size/depth/time limits, no script execution |
 | Prompt injection in repo/telemetry | Treat content as data; model cannot grant permissions or bypass policy |
+| Sensitive data exposure to AI/provider tools | Define provider, retention, logging, and data-minimization boundaries before sending repository, telemetry, tenant or credential-adjacent data to any model |
 | Unsafe generated patch | Allowlisted paths, bounded diff, patch validation, human review and CI |
 | Unauthorized deployment | Server-side RBAC, protected environments, required reviewers/checks, deny by default |
 | Cross-tenant access | Per-request authorization, tenant-scoped queries and negative tests |
@@ -32,6 +33,7 @@ Repository files, PR comments, telemetry, and external API responses can be mali
 5. Findings/remediations reference evidence and rule/policy versions.
 6. Missing evidence is never silently treated as success.
 7. Tenant/project authorization is checked server-side for every scoped operation.
+8. Repository, telemetry, tenant and audit data sent to external processors follows an explicit approved data-boundary decision.
 
 ## Residual risks
-External CI misconfiguration, incorrect/incomplete rules, compromised authorized users/identities, telemetry privacy/cost, and changing provider APIs require ongoing review.
+External CI misconfiguration, incorrect/incomplete rules, compromised authorized users/identities, telemetry privacy/cost, AI/provider data handling, and changing provider APIs require ongoing review.

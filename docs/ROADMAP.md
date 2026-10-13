@@ -19,4 +19,11 @@ A phase is complete only when acceptance evidence exists and the completion repo
 | 12 | Azure AKS | Reproducible infrastructure, identity/network validation, deployment and rollback docs |
 | 13 | Evaluation/release | Benchmarks, seeded-fault experiments, test report, threat review, docs and reproducible demo |
 
+## Phase 00 completion checklist
+- The repository is initialized and the foundation documents are tracked.
+- The six foundation documents agree on scope, safety boundaries, and phase ordering.
+- Open architecture/product/security decisions are explicit in `docs/DECISIONS.md`.
+- No document claims implemented behavior, benchmark results, production readiness, or external endorsement.
+- Security assumptions, trust boundaries, and least-privilege controls are recorded before feature implementation starts.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.

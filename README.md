@@ -4,6 +4,6 @@ CloudPilot is a continuous observability consistency assurance platform for clou
 
 **Current status:** Phase 00 foundation draft. Documentation is not implementation.
 
-Read `docs/PROJECT_BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/THREAT_MODEL.md`, and `docs/DECISIONS.md`.
+This Phase 00 foundation documentation consists of six files: this README, `docs/PROJECT_BIBLE.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/THREAT_MODEL.md`, and `docs/DECISIONS.md`.
 
-Initial scope: Kubernetes workloads, OpenTelemetry, Prometheus, GitHub pull requests, GitHub Actions, and Azure AKS. Core analysis should avoid unnecessary cloud-provider coupling. Deterministic rules own gap detection. Production-impacting changes require explicit authorization and policy checks.
+Initial product scope: Kubernetes workloads, OpenTelemetry, Prometheus, GitHub pull requests, GitHub Actions, and Azure AKS as the first cloud target. Phase 00 is documentation only; local behavior should be validated before cloud deployment work begins. Core analysis should avoid unnecessary cloud-provider coupling. Deterministic rules own gap detection. Production-impacting changes require explicit authorization and policy checks.

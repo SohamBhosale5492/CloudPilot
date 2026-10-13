@@ -42,4 +42,4 @@ Version APIs (e.g. `/api/v1`); validate inputs; use consistent errors and correl
 Local Docker Compose: frontend, API, PostgreSQL, demo services, OpenTelemetry Collector and Prometheus. First cloud target: Azure AKS with Helm/Terraform and managed/workload identity where supported.
 
 ## Open decisions
-Authentication provider, tenant isolation and row-level security, job queue, local logs/traces backend, GitHub App model, policy engine, audit integrity/retention.
+Authentication provider, tenant isolation and row-level security, job queue, local logs/traces backend, GitHub App model and minimum scopes, source of expected observability requirements, verification evidence windows and inconclusive thresholds, policy engine, audit integrity/retention, AI provider/data boundary.
