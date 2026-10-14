@@ -1,0 +1,109 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  projects    Project[]
+  users       User[]
+  auditEvents AuditEvent[]
+
+  @@map("tenants")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  email     String
+  role      String   // "admin" | "operator" | "viewer"
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@map("users")
+}
+
+model Project {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  name           String
+  repositoryUrl  String?  @map("repository_url")
+  expectedModel  Json?    @map("expected_model")
+  targetConfig   Json?    @map("target_config")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  scans  Scan[]
+
+  @@unique([tenantId, name])
+  @@unique([tenantId, id])
+  @@map("projects")
+}
+
+model Scan {
+  id            String    @id @default(uuid())
+  tenantId      String    @map("tenant_id")
+  projectId     String    @map("project_id")
+  status        String    // "pending" | "running" | "completed" | "failed"
+  triggeredById String?   @map("triggered_by_id")
+  startedAt     DateTime? @map("started_at")
+  completedAt   DateTime? @map("completed_at")
+  error         String?
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  project  Project   @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
+  findings Finding[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, projectId, createdAt(sort: Desc)])
+  @@map("scans")
+}
+
+model Finding {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  projectId      String   @map("project_id")
+  scanId         String   @map("scan_id")
+  requirementId  String   @map("requirement_id")
+  ruleId         String   @map("rule_id")
+  ruleVersion    String   @map("rule_version")
+  signal         String   // "metric" | "health" | "log" | "trace" | "alert"
+  outcome        String   // "pass" | "gap" | "unknown" | "inconclusive"
+  expected       String
+  observed       String
+  reason         String
+  evidenceJson   Json     @map("evidence_json")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  scan Scan @relation(fields: [tenantId, scanId], references: [tenantId, id], onDelete: Cascade)
+
+  @@index([tenantId, scanId])
+  @@map("findings")
+}
+
+model AuditEvent {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  projectId    String?  @map("project_id")
+  actorId      String   @map("actor_id")
+  action       String   // "PROJECT_CREATED" | "SCAN_TRIGGERED" | "SCAN_COMPLETED" | "SCAN_FAILED"
+  resourceType String   @map("resource_type")
+  resourceId   String   @map("resource_id")
+  metadataJson Json?    @map("metadata_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@map("audit_events")
+}

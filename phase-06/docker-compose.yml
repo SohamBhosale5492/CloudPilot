@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cloudpilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cloudpilot
+      POSTGRES_PASSWORD: cloudpilot_password
+      POSTGRES_DB: cloudpilot_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudpilot -d cloudpilot_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

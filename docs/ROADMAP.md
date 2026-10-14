@@ -48,4 +48,10 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - Outcome semantics, per-signal rules, configuration contract, and known limitations are documented in `phase-05/README.md`.
 - Phase 05 remains pending human review and is not marked complete by this note.
 
+## Phase 06 implementation notes
+- Authenticated REST API and persistence layer using PostgreSQL and Prisma.
+- Enforces OIDC/JWT verification, tenant isolation, deny-by-default RBAC, bounded asynchronous scans, and append-only audit logging.
+- Architecture, schema, endpoints, and limitations are documented in `phase-06/README.md`.
+- Phase 06 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
