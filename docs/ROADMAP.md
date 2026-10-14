@@ -43,4 +43,9 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - The inspector contracts, adapters, and limitations are documented in `phase-04/README.md`.
 - Phase 04 remains pending human review and is not marked complete by this note.
 
+## Phase 05 implementation notes
+- Deterministic gap engine evaluates expected observability requirements against pre-collected inspector evidence.
+- Outcome semantics, per-signal rules, configuration contract, and known limitations are documented in `phase-05/README.md`.
+- Phase 05 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
