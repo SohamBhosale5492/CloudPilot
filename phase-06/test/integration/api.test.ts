@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
 import { CloudPilotApiServer } from "../../src/api/server.js";
 import { checkDatabaseConnection, disconnectPrisma } from "../../src/db/client.js";
+import { ScanRepository, StaleWorkerError } from "../../src/db/scan-repo.js";
 import {
   mintTestJwt,
   TEST_PUBLIC_KEY,
@@ -571,32 +572,256 @@ async function runIntegrationSuite() {
       assert.match(body2.error, /SSRF/i);
     });
 
-    await test("IT: orphan recovery marks stranded pending/running scans as failed on restart", async () => {
-      // Create a project and insert a stranded 'running' scan directly in DB
-      const orphanProject = await prisma.project.create({
-        data: { tenantId: tenantAlpha.id, name: "orphan-test-proj" }
+    // ────── 12. Durable Job Coordination, Leases & Multi-Worker Concurrency ──────
+    const scanRepo = new ScanRepository(prisma);
+
+    await test("IT: two or more workers racing to claim one scan using FOR UPDATE SKIP LOCKED", async () => {
+      const raceProj = await prisma.project.create({
+        data: { tenantId: tenantAlpha.id, name: "worker-race-proj" }
       });
 
-      const strandedScan = await prisma.scan.create({
+      const pendingScan = await scanRepo.create({
+        tenantId: tenantAlpha.id,
+        projectId: raceProj.id
+      });
+
+      // Two workers attempt to claim simultaneously
+      const [claim1, claim2] = await Promise.all([
+        scanRepo.claimNextPendingScan("worker-node-1", 60),
+        scanRepo.claimNextPendingScan("worker-node-2", 60)
+      ]);
+
+      const claimedCount = [claim1, claim2].filter((c) => c !== null).length;
+      assert.equal(claimedCount, 1, "Exactly one worker must claim the scan row");
+
+      const winner = claim1 ?? claim2;
+      assert.equal(winner?.id, pendingScan.id);
+      assert.equal(winner?.status, "running");
+      assert.ok(winner?.workerId === "worker-node-1" || winner?.workerId === "worker-node-2");
+    });
+
+    await test("IT: concurrent scans for different projects run independently", async () => {
+      const projA = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "multi-proj-a" } });
+      const projB = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "multi-proj-b" } });
+
+      const scanA = await scanRepo.create({ tenantId: tenantAlpha.id, projectId: projA.id });
+      const scanB = await scanRepo.create({ tenantId: tenantAlpha.id, projectId: projB.id });
+
+      const claimA = await scanRepo.claimNextPendingScan("worker-A", 60);
+      const claimB = await scanRepo.claimNextPendingScan("worker-B", 60);
+
+      assert.ok(claimA);
+      assert.ok(claimB);
+      assert.notEqual(claimA.id, claimB.id);
+      assert.notEqual(claimA.projectId, claimB.projectId);
+    });
+
+    await test("IT: worker crash followed by lease expiry and recovery (re-queuing)", async () => {
+      const crashProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "crash-recovery-proj" } });
+      const crashedScan = await prisma.scan.create({
         data: {
           tenantId: tenantAlpha.id,
-          projectId: orphanProject.id,
+          projectId: crashProj.id,
           status: "running",
-          startedAt: new Date()
+          workerId: "crashed-worker-pid-999",
+          startedAt: new Date(),
+          heartbeatAt: new Date(Date.now() - 30000),
+          leaseExpiresAt: new Date(Date.now() - 5000), // Lease expired 5s ago
+          attemptCount: 1,
+          maxAttempts: 3
         }
       });
 
-      // Run orphan recovery
-      const { ScanRepository } = await import("../../src/db/scan-repo.js");
-      const scanRepo = new ScanRepository(prisma);
-      const recovered = await scanRepo.recoverOrphanedScans();
-      assert.ok(recovered >= 1);
+      const reclaimResult = await scanRepo.reclaimExpiredLeases();
+      assert.ok(reclaimResult.requeued >= 1);
 
-      // Verify the scan is now failed with explanation
-      const updatedScan = await scanRepo.findById(tenantAlpha.id, strandedScan.id);
-      assert.ok(updatedScan);
-      assert.equal(updatedScan.status, "failed");
-      assert.match(updatedScan.error ?? "", /shutdown or restart/i);
+      const recovered = await scanRepo.findById(tenantAlpha.id, crashedScan.id);
+      assert.ok(recovered);
+      assert.equal(recovered.status, "pending", "Expired lease should be re-queued to pending");
+      assert.equal(recovered.workerId, null, "Worker ID must be cleared for re-queuing");
+      assert.match(recovered.error ?? "", /re-queued/i);
+    });
+
+    await test("IT: retry exhaustion and terminal failure", async () => {
+      const exhaustedProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "exhausted-proj" } });
+      const exhaustedScan = await prisma.scan.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: exhaustedProj.id,
+          status: "running",
+          workerId: "terminal-crashed-worker",
+          startedAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() - 5000), // Lease expired
+          attemptCount: 3,
+          maxAttempts: 3 // Exhausted
+        }
+      });
+
+      const reclaimResult = await scanRepo.reclaimExpiredLeases();
+      assert.ok(reclaimResult.permanentlyFailed >= 1);
+
+      const failedScan = await scanRepo.findById(tenantAlpha.id, exhaustedScan.id);
+      assert.ok(failedScan);
+      assert.equal(failedScan.status, "failed", "Exhausted scan must transition to failed");
+      assert.ok(failedScan.completedAt, "Completed timestamp must be set on terminal failure");
+      assert.match(failedScan.error ?? "", /maximum retry attempts exceeded/i);
+    });
+
+    await test("IT: healthy long-running scan with recurring heartbeats is not reaped", async () => {
+      const healthyProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "healthy-heartbeat-proj" } });
+      const activeScan = await prisma.scan.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: healthyProj.id,
+          status: "running",
+          workerId: "alive-worker-1",
+          startedAt: new Date(),
+          heartbeatAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() + 60000), // 60s in future
+          attemptCount: 1,
+          maxAttempts: 3
+        }
+      });
+
+      // Renew lease explicitly
+      const renewed = await scanRepo.renewLease(tenantAlpha.id, activeScan.id, "alive-worker-1", 120);
+      assert.equal(renewed, true);
+
+      // Run reaper
+      await scanRepo.reclaimExpiredLeases();
+
+      // Scan should remain running
+      const verifiedScan = await scanRepo.findById(tenantAlpha.id, activeScan.id);
+      assert.ok(verifiedScan);
+      assert.equal(verifiedScan.status, "running");
+    });
+
+    await test("IT: new replica starting while another replica owns a valid lease does not fail it", async () => {
+      const peerProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "peer-replica-proj" } });
+      const peerScan = await prisma.scan.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: peerProj.id,
+          status: "running",
+          workerId: "replica-1-living",
+          startedAt: new Date(),
+          heartbeatAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() + 60000), // Valid future lease
+          attemptCount: 1,
+          maxAttempts: 3
+        }
+      });
+
+      // Replica 2 starts up
+      const { BoundedScanRunner } = await import("../../src/jobs/scan-runner.js");
+      const replica2Runner = new BoundedScanRunner(prisma, { workerId: "replica-2-booting" });
+      await replica2Runner.initialize();
+
+      // Verify Replica 1's scan is undisturbed
+      const checkedScan = await scanRepo.findById(tenantAlpha.id, peerScan.id);
+      assert.ok(checkedScan);
+      assert.equal(checkedScan.status, "running", "Living peer's active scan must NOT be failed on new replica start");
+
+      await replica2Runner.shutdown();
+    });
+
+    await test("IT: stale worker attempting to publish after losing its lease is rejected (StaleWorkerError)", async () => {
+      const staleProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "stale-worker-proj" } });
+      const staleScan = await prisma.scan.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: staleProj.id,
+          status: "running",
+          workerId: "stale-worker-lost-lease",
+          startedAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() - 10000), // Expired lease
+          attemptCount: 1,
+          maxAttempts: 3
+        }
+      });
+
+      // Attempting to publish findings should throw StaleWorkerError
+      await assert.rejects(
+        async () => {
+          await scanRepo.completeScanWithFindings(tenantAlpha.id, staleProj.id, staleScan.id, "stale-worker-lost-lease", [
+            {
+              requirementId: "req-stale",
+              ruleId: "rule-1",
+              ruleVersion: "1.0",
+              signal: "metric",
+              outcome: "pass",
+              expected: "pass",
+              observed: "pass",
+              reason: "stale publication",
+              evidenceJson: {}
+            }
+          ]);
+        },
+        (err: unknown) => {
+          assert.ok(err instanceof StaleWorkerError);
+          assert.equal((err as StaleWorkerError).statusCode, 409);
+          return true;
+        }
+      );
+
+      // Verify no findings were persisted
+      const findings = await prisma.finding.findMany({ where: { scanId: staleScan.id } });
+      assert.equal(findings.length, 0, "No findings must be published by a stale worker");
+    });
+
+    await test("IT: no duplicated or cross-tenant findings after retries", async () => {
+      const retryProj = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "retry-findings-proj" } });
+      const retryScan = await prisma.scan.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: retryProj.id,
+          status: "running",
+          workerId: "valid-retry-worker",
+          startedAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() + 60000),
+          attemptCount: 2,
+          maxAttempts: 3
+        }
+      });
+
+      // Seed finding from failed attempt 1
+      await prisma.finding.create({
+        data: {
+          tenantId: tenantAlpha.id,
+          projectId: retryProj.id,
+          scanId: retryScan.id,
+          attemptNumber: 1,
+          requirementId: "req-1",
+          ruleId: "r-1",
+          ruleVersion: "1.0",
+          signal: "health",
+          outcome: "unknown",
+          expected: "healthy",
+          observed: "timeout",
+          reason: "attempt 1 failed",
+          evidenceJson: {}
+        }
+      });
+
+      // Attempt 2 succeeds and publishes findings atomically
+      await scanRepo.completeScanWithFindings(tenantAlpha.id, retryProj.id, retryScan.id, "valid-retry-worker", [
+        {
+          requirementId: "req-1",
+          ruleId: "r-1",
+          ruleVersion: "1.0",
+          signal: "health",
+          outcome: "pass",
+          expected: "healthy",
+          observed: "healthy",
+          reason: "attempt 2 succeeded",
+          evidenceJson: {}
+        }
+      ]);
+
+      const finalFindings = await prisma.finding.findMany({ where: { scanId: retryScan.id } });
+      assert.equal(finalFindings.length, 1, "Findings from attempt 1 must be purged; exactly 1 final finding");
+      assert.equal(finalFindings[0].outcome, "pass");
+      assert.equal(finalFindings[0].attemptNumber, 2);
     });
 
   } finally {

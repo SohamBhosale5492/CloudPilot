@@ -67,9 +67,20 @@ Server-side role-based access control enforces least privilege across three defi
 - **Application Level**: The runner checks active scans before enqueueing, rejecting concurrent requests with HTTP `409 Conflict`.
 - **Queue Limits**: Maximum queue capacity is bounded to 50 pending jobs with maximum concurrency of 5 workers.
 
-### Restart & Orphan Recovery
-- In-process jobs in memory are bounded and can be lost on server restart or crash.
-- On startup, `BoundedScanRunner.initialize()` detects any scans left in `pending` or `running` state and updates them to `failed` with an explicit reason (`"Job abandoned due to server shutdown or restart."`), preventing deadlocks.
+### Durable PostgreSQL Job Coordination & Concurrency
+- **PostgreSQL-Backed Queue**: Scans are persisted in the `scans` table and claimed atomically across worker replicas using `SELECT ... FOR UPDATE SKIP LOCKED`. Memory is not the source of truth.
+- **Worker Leases & Heartbeats**: Workers claim scans for a bounded lease duration (default 60s) and periodically update `heartbeat_at` and `lease_expires_at`.
+- **Safe Lease Reaper**: A background reaper checks for expired worker leases. Scans whose attempt count is below `max_attempts` are automatically re-queued to `pending`; scans exceeding `max_attempts` transition to terminal `failed`.
+- **Safe Multi-Replica Startup**: The legacy blanket termination of active scans on startup has been removed. Booting a new replica safely reclaims only expired leases without disturbing healthy living peers.
+- **Stale Worker Safeguard**: Result publication requires worker lease verification in an atomic database transaction. If a worker lost its lease due to timeout or network partition, publication throws `StaleWorkerError` and findings are rejected, ensuring at-least-once execution with idempotent result publication.
+- **Attempt-Scoped Findings**: Each finding records `attempt_number`. Findings from aborted previous attempts are purged atomically before publishing the successful attempt.
+
+### Production OIDC Discovery & JWKS Rotation
+- Discovers OIDC configuration from the preconfigured trusted issuer (`/.well-known/openid-configuration`) and resolves keys from its validated `jwks_uri`.
+- Supports asymmetric algorithms (`RS256`, `ES256` via native P-256 IEEE P1363).
+- Unconditionally rejects `none`, `jku`/`x5u` token headers, and symmetric algorithms (`HS256`) in JWKS mode.
+- Caches public keys with bounded memory and TTL, and throttles unknown-`kid` refresh requests to prevent outbound fetch abuse and cache-stampede DDoS attacks.
+- Strict SSRF policy blocks cloud metadata service endpoints (`169.254.169.254`, `metadata.google.internal`) and unauthorized private IP addresses.
 
 ## API Endpoints
 
@@ -99,22 +110,22 @@ Default connection string:
 
 ### 2. Running Migrations
 ```bash
-npx --prefix phase-06 prisma migrate dev
+npx --prefix phase-06 prisma migrate deploy
 ```
 
 ### 3. Running Unit Tests
-Unit tests validate JWT verification, algorithm constraints, claims validation, RBAC deny-by-default, URL sanitization, and scan queue bounding without requiring external services:
+Unit tests validate JWT verification, JWKS discovery, key rotation, unknown-kid throttling, ES256 IEEE-P1363 cryptography, SSRF protection, RBAC deny-by-default, URL sanitization, and durable queue mechanics:
 ```bash
 npm --prefix phase-06 run test:unit
 ```
 
 ### 4. Running Integration Tests
-Integration tests run against real PostgreSQL (strictly no SQLite substitution). If PostgreSQL is unavailable, the suite fails with an actionable diagnostic pointing to Docker Compose:
+Integration tests run against PostgreSQL (strictly no SQLite substitution). The suite validates multi-worker concurrency, `FOR UPDATE SKIP LOCKED` racing, lease renewal, crash recovery, retry exhaustion, and stale worker protection:
 ```bash
 npm --prefix phase-06 run test:integration
 ```
 
 ## Known Limitations & Deferred Capabilities
-- **Distributed Queue**: Uses an in-process bounded queue. Redis/Celery/message brokers are deferred to later hardening phases.
-- **JWKS Network Fetching**: Uses local public keys / test signer for deterministic testing. Dynamic JWKS network retrieval with key rotation is deferred to production hardening.
+- **Distributed Broker**: Employs PostgreSQL `FOR UPDATE SKIP LOCKED` coordination instead of Redis/Celery. External distributed messaging brokers remain deferred until operational load requires dedicated message queuing.
+- **Dynamic JWKS Rotation Over External Network**: Tests run hermetically with mock OIDC discovery and JWKS servers; production deployment requires internet connectivity to the configured identity provider.
 - **Remediation & Mutation**: Phase 06 persists findings only; code patching and GitHub pull request creation are deferred to Phase 07.

@@ -1,51 +1,48 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
-import { BoundedScanRunner, ActiveScanConflictError, ScanQueueFullError } from "../../src/jobs/scan-runner.js";
+import {
+  BoundedScanRunner,
+  ActiveScanConflictError,
+  ScanQueueFullError,
+  StaleWorkerError
+} from "../../src/jobs/scan-runner.js";
 
-// Minimal mock prisma for unit-testing queue behaviors without DB
-function createMockPrisma(activeScan?: Record<string, unknown>): PrismaClient {
+function createMockPrisma(activeScan?: Record<string, unknown>, pendingCount = 0): PrismaClient {
+  let countVal = pendingCount;
   return {
     scan: {
       findFirst: async () => activeScan ?? null,
+      findUniqueOrThrow: async () => ({ id: "s1", attemptCount: 1, ...(activeScan ?? {}) }),
       update: async () => ({}),
       updateMany: async () => ({ count: 0 }),
-      create: async () => ({})
+      create: async () => ({}),
+      count: async () => countVal
     },
     project: {
       findFirst: async () => null
     },
     finding: {
-      createMany: async () => ({ count: 0 })
+      createMany: async () => ({ count: 0 }),
+      deleteMany: async () => ({ count: 0 })
     },
     auditEvent: {
       create: async () => ({})
-    }
+    },
+    $queryRaw: async () => [],
+    $executeRaw: async () => 0,
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(createMockPrisma(activeScan, pendingCount))
   } as unknown as PrismaClient;
 }
 
 test("BoundedScanRunner: rejects enqueue when queue capacity is reached", async () => {
-  // 0 concurrency: nothing drains the queue
-  const runner = new BoundedScanRunner(createMockPrisma(), {
+  // DB reports 2 pending scans, max capacity is 2
+  const mockPrisma = createMockPrisma(undefined, 2);
+  const runner = new BoundedScanRunner(mockPrisma, {
     maxConcurrency: 0,
     maxQueueCapacity: 2
   });
 
-  await runner.enqueue({
-    tenantId: "t1",
-    projectId: "p1",
-    scanId: "s1",
-    actorId: "u1"
-  });
-
-  await runner.enqueue({
-    tenantId: "t1",
-    projectId: "p2",
-    scanId: "s2",
-    actorId: "u1"
-  });
-
-  // Third enqueue exceeds capacity of 2
   await assert.rejects(
     async () => {
       await runner.enqueue({
@@ -63,39 +60,7 @@ test("BoundedScanRunner: rejects enqueue when queue capacity is reached", async 
   );
 });
 
-test("BoundedScanRunner: rejects queued duplicate project (in-memory conflict)", async () => {
-  const runner = new BoundedScanRunner(createMockPrisma(), {
-    maxConcurrency: 0,
-    maxQueueCapacity: 10
-  });
-
-  await runner.enqueue({
-    tenantId: "t1",
-    projectId: "proj-dup",
-    scanId: "s1",
-    actorId: "u1"
-  });
-
-  // Same project second time: should detect it's in the inProcessProjects set
-  await assert.rejects(
-    async () => {
-      await runner.enqueue({
-        tenantId: "t1",
-        projectId: "proj-dup",
-        scanId: "s2",
-        actorId: "u1"
-      });
-    },
-    (err: unknown) => {
-      assert.ok(err instanceof ActiveScanConflictError);
-      assert.equal((err as ActiveScanConflictError).statusCode, 409);
-      return true;
-    }
-  );
-});
-
 test("BoundedScanRunner: rejects DB-persisted active scan for same project", async () => {
-  // Mock DB returns an active scan (already persisted in DB from another replica)
   const runner = new BoundedScanRunner(
     createMockPrisma({ id: "db-active-scan", status: "running" }),
     { maxConcurrency: 0, maxQueueCapacity: 10 }
@@ -119,20 +84,20 @@ test("BoundedScanRunner: rejects DB-persisted active scan for same project", asy
 });
 
 test("BoundedScanRunner: different tenants with same projectId are independent", async () => {
-  // Same projectId but different tenantIds must NOT conflict
   const runner = new BoundedScanRunner(createMockPrisma(), {
     maxConcurrency: 0,
     maxQueueCapacity: 10
   });
 
-  await runner.enqueue({
-    tenantId: "tenant-a",
-    projectId: "same-project-id",
-    scanId: "s1",
-    actorId: "u1"
+  await assert.doesNotReject(async () => {
+    await runner.enqueue({
+      tenantId: "tenant-a",
+      projectId: "same-project-id",
+      scanId: "s1",
+      actorId: "u1"
+    });
   });
 
-  // Different tenant — should succeed
   await assert.doesNotReject(async () => {
     await runner.enqueue({
       tenantId: "tenant-b",
@@ -143,24 +108,17 @@ test("BoundedScanRunner: different tenants with same projectId are independent",
   });
 });
 
-test("BoundedScanRunner: queueLength and activeWorkers properties", async () => {
+test("BoundedScanRunner: activeWorkers property tracks in-flight executions", async () => {
   const runner = new BoundedScanRunner(createMockPrisma(), {
-    maxConcurrency: 0,
+    maxConcurrency: 5,
     maxQueueCapacity: 10
   });
 
-  assert.equal(runner.queueLength, 0);
   assert.equal(runner.activeWorkers, 0);
-
-  await runner.enqueue({ tenantId: "t1", projectId: "p1", scanId: "s1", actorId: "u1" });
-  assert.equal(runner.queueLength, 1);
-
-  await runner.enqueue({ tenantId: "t1", projectId: "p2", scanId: "s2", actorId: "u1" });
-  assert.equal(runner.queueLength, 2);
+  assert.equal(runner.queueLength, 0);
 });
 
 test("BoundedScanRunner: same scanId in DB does not conflict (this replica created it)", async () => {
-  // activeScan.id === task.scanId means THIS call created the scan — no conflict
   const runner = new BoundedScanRunner(
     createMockPrisma({ id: "my-own-scan", status: "pending" }),
     { maxConcurrency: 0, maxQueueCapacity: 10 }
@@ -170,7 +128,7 @@ test("BoundedScanRunner: same scanId in DB does not conflict (this replica creat
     await runner.enqueue({
       tenantId: "t1",
       projectId: "proj-self",
-      scanId: "my-own-scan", // matches DB active scan id
+      scanId: "my-own-scan",
       actorId: "u1"
     });
   });
@@ -222,4 +180,10 @@ test("ScanRepository: P2002 unique constraint error throws ActiveScanConflictErr
       return true;
     }
   );
+});
+
+test("ScanRepository: StaleWorkerError has status 409", () => {
+  const err = new StaleWorkerError("scan-1", "worker-1");
+  assert.equal(err.statusCode, 409);
+  assert.match(err.message, /lost active lease/i);
 });

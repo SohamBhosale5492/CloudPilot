@@ -51,21 +51,29 @@ model Project {
 }
 
 model Scan {
-  id            String    @id @default(uuid())
-  tenantId      String    @map("tenant_id")
-  projectId     String    @map("project_id")
-  status        String    // "pending" | "running" | "completed" | "failed"
-  triggeredById String?   @map("triggered_by_id")
-  startedAt     DateTime? @map("started_at")
-  completedAt   DateTime? @map("completed_at")
-  error         String?
-  createdAt     DateTime  @default(now()) @map("created_at")
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  projectId      String    @map("project_id")
+  status         String    // "pending" | "running" | "completed" | "failed"
+  triggeredById  String?   @map("triggered_by_id")
+  startedAt      DateTime? @map("started_at")
+  completedAt    DateTime? @map("completed_at")
+  error          String?
+  workerId       String?   @map("worker_id")
+  claimedAt      DateTime? @map("claimed_at")
+  heartbeatAt    DateTime? @map("heartbeat_at")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  attemptCount   Int       @default(0) @map("attempt_count")
+  maxAttempts    Int       @default(3) @map("max_attempts")
+  modelOverride  Json?     @map("model_override")
+  createdAt      DateTime  @default(now()) @map("created_at")
 
   project  Project   @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
   findings Finding[]
 
   @@unique([tenantId, id])
   @@index([tenantId, projectId, createdAt(sort: Desc)])
+  @@index([leaseExpiresAt], map: "idx_scans_lease_expires")
   @@map("scans")
 }
 
@@ -74,6 +82,7 @@ model Finding {
   tenantId       String   @map("tenant_id")
   projectId      String   @map("project_id")
   scanId         String   @map("scan_id")
+  attemptNumber  Int      @default(1) @map("attempt_number")
   requirementId  String   @map("requirement_id")
   ruleId         String   @map("rule_id")
   ruleVersion    String   @map("rule_version")
@@ -88,6 +97,7 @@ model Finding {
   scan Scan @relation(fields: [tenantId, scanId], references: [tenantId, id], onDelete: Cascade)
 
   @@index([tenantId, scanId])
+  @@index([tenantId, scanId, attemptNumber], map: "idx_findings_scan_attempt")
   @@map("findings")
 }
 

@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import { UserRole } from "../src/auth/jwt-verifier.js";
 
 // Test-only RSA keypair generated for local testing suites.
-// Distinct from any production setup; not a backdoor since verification requires the matching public key.
 const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
   modulusLength: 2048,
   publicKeyEncoding: {
@@ -15,8 +14,24 @@ const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
   }
 });
 
+// Test-only EC P-256 keypair generated for local ES256 testing.
+const { privateKey: ecPrivateKey, publicKey: ecPublicKey } = crypto.generateKeyPairSync("ec", {
+  namedCurve: "P-256",
+  publicKeyEncoding: {
+    type: "spki",
+    format: "pem"
+  },
+  privateKeyEncoding: {
+    type: "pkcs8",
+    format: "pem"
+  }
+});
+
 export const TEST_PUBLIC_KEY = publicKey;
 export const TEST_PRIVATE_KEY = privateKey;
+export const TEST_EC_PUBLIC_KEY = ecPublicKey;
+export const TEST_EC_PRIVATE_KEY = ecPrivateKey;
+
 export const TEST_ISSUER = "https://auth.cloudpilot.test";
 export const TEST_AUDIENCE = "cloudpilot-api";
 export const TEST_SECRET = "test-hmac-secret-at-least-32-bytes-long!";
@@ -31,7 +46,10 @@ export interface MintTokenOptions {
   expSecondsFromNow?: number;
   nbfSecondsFromNow?: number;
   iatSecondsFromNow?: number;
-  algorithm?: "RS256" | "HS256";
+  algorithm?: "RS256" | "HS256" | "ES256";
+  kid?: string;
+  jku?: string;
+  x5u?: string;
   signingKey?: string;
   customClaims?: Record<string, unknown>;
 }
@@ -40,10 +58,19 @@ export function mintTestJwt(options: MintTokenOptions = {}): string {
   const alg = options.algorithm ?? "RS256";
   const now = Math.floor(Date.now() / 1000);
 
-  const header = {
+  const header: Record<string, unknown> = {
     alg,
     typ: "JWT"
   };
+  if (options.kid !== undefined) {
+    header.kid = options.kid;
+  }
+  if (options.jku !== undefined) {
+    header.jku = options.jku;
+  }
+  if (options.x5u !== undefined) {
+    header.x5u = options.x5u;
+  }
 
   const exp = options.expSecondsFromNow !== undefined
     ? now + options.expSecondsFromNow
@@ -76,6 +103,11 @@ export function mintTestJwt(options: MintTokenOptions = {}): string {
     const signer = crypto.createSign("RSA-SHA256");
     signer.update(signedData);
     signature = signer.sign(key);
+  } else if (alg === "ES256") {
+    const key = options.signingKey ?? TEST_EC_PRIVATE_KEY;
+    const signer = crypto.createSign("SHA256");
+    signer.update(signedData);
+    signature = signer.sign({ key, dsaEncoding: "ieee-p1363" });
   } else if (alg === "HS256") {
     const key = options.signingKey ?? TEST_SECRET;
     const hmac = crypto.createHmac("sha256", key);

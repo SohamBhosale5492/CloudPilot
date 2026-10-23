@@ -1,5 +1,6 @@
-import { PrismaClient, Scan } from "@prisma/client";
+import { PrismaClient, Scan, Prisma } from "@prisma/client";
 import { PaginatedResult, InvalidCursorError } from "./project-repo.js";
+import { FindingInput } from "./finding-repo.js";
 
 export type ScanStatus = "pending" | "running" | "completed" | "failed";
 
@@ -7,6 +8,8 @@ export interface CreateScanInput {
   tenantId: string;
   projectId: string;
   triggeredById?: string;
+  maxAttempts?: number;
+  modelOverride?: unknown;
 }
 
 export interface UpdateScanStatusInput {
@@ -14,6 +17,10 @@ export interface UpdateScanStatusInput {
   startedAt?: Date;
   completedAt?: Date;
   error?: string | null;
+  workerId?: string | null;
+  heartbeatAt?: Date;
+  leaseExpiresAt?: Date;
+  attemptCount?: number;
 }
 
 export interface ListScansOptions {
@@ -21,11 +28,24 @@ export interface ListScansOptions {
   cursor?: string;
 }
 
+export interface ReclaimResult {
+  requeued: number;
+  permanentlyFailed: number;
+}
+
 export class ActiveScanConflictError extends Error {
   readonly statusCode = 409;
   constructor(projectId: string) {
     super(`An active scan is already pending or running for project ${projectId}.`);
     this.name = "ActiveScanConflictError";
+  }
+}
+
+export class StaleWorkerError extends Error {
+  readonly statusCode = 409;
+  constructor(scanId: string, workerId: string) {
+    super(`Worker ${workerId} lost active lease for scan ${scanId}; publication rejected.`);
+    this.name = "StaleWorkerError";
   }
 }
 
@@ -39,7 +59,9 @@ export class ScanRepository {
           tenantId: input.tenantId,
           projectId: input.projectId,
           status: "pending",
-          triggeredById: input.triggeredById ?? null
+          triggeredById: input.triggeredById ?? null,
+          maxAttempts: input.maxAttempts ?? 3,
+          modelOverride: (input.modelOverride as Prisma.InputJsonValue) ?? Prisma.JsonNull
         }
       });
     } catch (err: unknown) {
@@ -121,26 +143,225 @@ export class ScanRepository {
         status: input.status,
         ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
         ...(input.completedAt !== undefined ? { completedAt: input.completedAt } : {}),
-        ...(input.error !== undefined ? { error: input.error } : {})
+        ...(input.error !== undefined ? { error: input.error } : {}),
+        ...(input.workerId !== undefined ? { workerId: input.workerId } : {}),
+        ...(input.heartbeatAt !== undefined ? { heartbeatAt: input.heartbeatAt } : {}),
+        ...(input.leaseExpiresAt !== undefined ? { leaseExpiresAt: input.leaseExpiresAt } : {}),
+        ...(input.attemptCount !== undefined ? { attemptCount: input.attemptCount } : {})
       }
     });
   }
 
   /**
-   * Recovers orphaned jobs left in "pending" or "running" state across restarts.
+   * Atomically claims the next pending scan using PostgreSQL FOR UPDATE SKIP LOCKED.
+   * Increments attempt_count, assigns workerId, and sets initial lease duration.
+   */
+  async claimNextPendingScan(workerId: string, leaseDurationSeconds = 300): Promise<Scan | null> {
+    const claimedRows = await this.prisma.$queryRaw<Array<Record<string, unknown>>>`
+      WITH claim AS (
+        SELECT id
+        FROM scans
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      UPDATE scans
+      SET status = 'running',
+          worker_id = ${workerId},
+          started_at = COALESCE(scans.started_at, NOW()),
+          claimed_at = NOW(),
+          heartbeat_at = NOW(),
+          lease_expires_at = NOW() + (${leaseDurationSeconds} * INTERVAL '1 second'),
+          attempt_count = scans.attempt_count + 1
+      FROM claim
+      WHERE scans.id = claim.id
+      RETURNING
+        scans.id,
+        scans.tenant_id AS "tenantId",
+        scans.project_id AS "projectId",
+        scans.status,
+        scans.triggered_by_id AS "triggeredById",
+        scans.started_at AS "startedAt",
+        scans.completed_at AS "completedAt",
+        scans.error,
+        scans.worker_id AS "workerId",
+        scans.claimed_at AS "claimedAt",
+        scans.heartbeat_at AS "heartbeatAt",
+        scans.lease_expires_at AS "leaseExpiresAt",
+        scans.attempt_count AS "attemptCount",
+        scans.max_attempts AS "maxAttempts",
+        scans.model_override AS "modelOverride",
+        scans.created_at AS "createdAt";
+    `;
+
+    if (claimedRows.length === 0) {
+      return null;
+    }
+
+    const row = claimedRows[0];
+    return {
+      id: row.id as string,
+      tenantId: (row.tenantId ?? row.tenant_id) as string,
+      projectId: (row.projectId ?? row.project_id) as string,
+      status: row.status as string,
+      triggeredById: ((row.triggeredById ?? row.triggered_by_id) as string) ?? null,
+      startedAt: ((row.startedAt ?? row.started_at) as Date) ?? null,
+      completedAt: ((row.completedAt ?? row.completed_at) as Date) ?? null,
+      error: ((row.error ?? row.error) as string) ?? null,
+      workerId: ((row.workerId ?? row.worker_id) as string) ?? null,
+      claimedAt: ((row.claimedAt ?? row.claimed_at) as Date) ?? null,
+      heartbeatAt: ((row.heartbeatAt ?? row.heartbeat_at) as Date) ?? null,
+      leaseExpiresAt: ((row.leaseExpiresAt ?? row.lease_expires_at) as Date) ?? null,
+      attemptCount: ((row.attemptCount ?? row.attempt_count) as number) ?? 0,
+      maxAttempts: ((row.maxAttempts ?? row.max_attempts) as number) ?? 3,
+      modelOverride: (row.modelOverride ?? row.model_override ?? null) as Prisma.JsonValue,
+      createdAt: (row.createdAt ?? row.created_at) as Date
+    };
+  }
+
+  /**
+   * Renews the lease conditionally using scan ID, worker ID, and running status.
+   * Returns false if the worker no longer owns the active lease.
+   */
+  async renewLease(tenantId: string, scanId: string, workerId: string, leaseDurationSeconds = 300): Promise<boolean> {
+    const count = await this.prisma.$executeRaw`
+      UPDATE scans
+      SET heartbeat_at = NOW(),
+          lease_expires_at = NOW() + (${leaseDurationSeconds} * INTERVAL '1 second')
+      WHERE id = ${scanId}
+        AND tenant_id = ${tenantId}
+        AND worker_id = ${workerId}
+        AND status = 'running';
+    `;
+
+    return count > 0;
+  }
+
+  /**
+   * Atomically publishes scan completion and findings inside a transaction.
+   * Strictly enforces that the worker still holds the lease at time of publication.
+   * Throws StaleWorkerError if lease was lost, rolling back findings.
+   */
+  async completeScanWithFindings(
+    tenantId: string,
+    projectId: string,
+    scanId: string,
+    workerId: string,
+    findings: FindingInput[]
+  ): Promise<Scan> {
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Conditionally update scan to completed, asserting valid active lease
+      const updatedCount = await tx.$executeRaw`
+        UPDATE scans
+        SET status = 'completed',
+            completed_at = NOW()
+        WHERE id = ${scanId}
+          AND tenant_id = ${tenantId}
+          AND worker_id = ${workerId}
+          AND status = 'running'
+          AND lease_expires_at > NOW();
+      `;
+
+      if (updatedCount === 0) {
+        throw new StaleWorkerError(scanId, workerId);
+      }
+
+      const scan = await tx.scan.findUniqueOrThrow({
+        where: { id: scanId }
+      });
+      const attemptNumber = scan.attemptCount;
+
+      // 2. Remove any partial findings from prior attempts
+      await tx.finding.deleteMany({
+        where: { tenantId, scanId }
+      });
+
+      // 3. Atomically publish findings for the successful attempt
+      if (findings.length > 0) {
+        await tx.finding.createMany({
+          data: findings.map((f) => ({
+            tenantId,
+            projectId,
+            scanId,
+            attemptNumber,
+            requirementId: f.requirementId,
+            ruleId: f.ruleId,
+            ruleVersion: f.ruleVersion,
+            signal: f.signal,
+            outcome: f.outcome,
+            expected: f.expected,
+            observed: f.observed,
+            reason: f.reason,
+            evidenceJson: (f.evidenceJson as Prisma.InputJsonValue) ?? Prisma.JsonNull
+          }))
+        });
+      }
+
+      return scan;
+    });
+  }
+
+  /**
+   * Conditionally marks a scan as failed if the worker still holds the active lease.
+   */
+  async failScanWithLease(
+    tenantId: string,
+    scanId: string,
+    workerId: string,
+    errorMessage: string
+  ): Promise<boolean> {
+    const updatedCount = await this.prisma.$executeRaw`
+      UPDATE scans
+      SET status = 'failed',
+          error = ${errorMessage},
+          completed_at = NOW()
+      WHERE id = ${scanId}
+        AND tenant_id = ${tenantId}
+        AND worker_id = ${workerId}
+        AND status = 'running';
+    `;
+
+    return updatedCount > 0;
+  }
+
+  /**
+   * Reclaims expired leases.
+   * Jobs with attempt_count < max_attempts are re-queued to 'pending'.
+   * Jobs with attempt_count >= max_attempts transition to terminal 'failed'.
+   */
+  async reclaimExpiredLeases(): Promise<ReclaimResult> {
+    const requeuedCount = await this.prisma.$executeRaw`
+      UPDATE scans
+      SET status = 'pending',
+          worker_id = NULL,
+          error = 'Worker lease expired; re-queued for retry.'
+      WHERE status = 'running'
+        AND lease_expires_at < NOW()
+        AND attempt_count < max_attempts;
+    `;
+
+    const permanentlyFailedCount = await this.prisma.$executeRaw`
+      UPDATE scans
+      SET status = 'failed',
+          completed_at = NOW(),
+          error = 'Scan failed: worker lease expired and maximum retry attempts exceeded.'
+      WHERE status = 'running'
+        AND lease_expires_at < NOW()
+        AND attempt_count >= max_attempts;
+    `;
+
+    return {
+      requeued: requeuedCount,
+      permanentlyFailed: permanentlyFailedCount
+    };
+  }
+
+  /**
+   * Deprecated compatibility helper: delegates to reclaimExpiredLeases().
    */
   async recoverOrphanedScans(): Promise<number> {
-    const result = await this.prisma.scan.updateMany({
-      where: {
-        status: { in: ["pending", "running"] }
-      },
-      data: {
-        status: "failed",
-        error: "Job abandoned due to server shutdown or restart.",
-        completedAt: new Date()
-      }
-    });
-
-    return result.count;
+    const res = await this.reclaimExpiredLeases();
+    return res.requeued + res.permanentlyFailed;
   }
 }

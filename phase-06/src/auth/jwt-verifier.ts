@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { JwksKeyResolver } from "./jwks-resolver.js";
 
 export type UserRole = "admin" | "operator" | "viewer";
 
@@ -13,9 +14,15 @@ export interface SecurityContext {
   identity: AuthenticatedIdentity;
 }
 
-export interface JwtVerifierConfig {
+export interface BaseJwtVerifierConfig {
   expectedIssuer: string;
   expectedAudience: string;
+  allowedAlgorithms?: string[];
+  /** Allowed clock skew in milliseconds (default: 30000ms / 30s) */
+  clockSkewMs?: number;
+}
+
+export interface StaticJwtVerifierConfig extends BaseJwtVerifierConfig {
   /**
    * Public key (PEM string or KeyObject) for RS256, or HMAC secret string for HS256.
    *
@@ -26,17 +33,16 @@ export interface JwtVerifierConfig {
    * private keys that are never shared with resource servers.
    */
   publicKeyOrSecret: string | crypto.KeyObject;
-  /**
-   * Explicitly restrict which algorithms are accepted.
-   *
-   * Defaults to ["RS256"] only. Callers MUST explicitly list "HS256" to
-   * accept symmetric tokens. Algorithm "none" is ALWAYS rejected regardless
-   * of this list, preventing unsigned token acceptance.
-   */
-  allowedAlgorithms?: string[];
-  /** Allowed clock skew in milliseconds (default: 30000ms / 30s) */
-  clockSkewMs?: number;
 }
+
+export interface JwksJwtVerifierConfig extends BaseJwtVerifierConfig {
+  /**
+   * JWKS key resolver that discovers and fetches public keys from the trusted OIDC provider.
+   */
+  keyResolver: JwksKeyResolver;
+}
+
+export type JwtVerifierConfig = StaticJwtVerifierConfig | JwksJwtVerifierConfig;
 
 export interface JwtVerificationResult {
   valid: boolean;
@@ -49,6 +55,8 @@ interface JwtHeader {
   alg: string;
   typ?: string;
   kid?: string;
+  jku?: string;
+  x5u?: string;
 }
 
 interface JwtPayload {
@@ -64,74 +72,11 @@ interface JwtPayload {
   [key: string]: unknown;
 }
 
-export function verifyJwtToken(token: string, config: JwtVerifierConfig, now: Date = new Date()): JwtVerificationResult {
-  if (typeof token !== "string" || token.trim().length === 0) {
-    return { valid: false, error: "Missing or empty token.", statusCode: 401 };
-  }
-
-  const parts = token.trim().split(".");
-  if (parts.length !== 3) {
-    return { valid: false, error: "Malformed JWT token structure.", statusCode: 401 };
-  }
-
-  const [headerB64, payloadB64, signatureB64] = parts;
-
-  let header: JwtHeader;
-  let payload: JwtPayload;
-
-  try {
-    header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8"));
-    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
-  } catch {
-    return { valid: false, error: "Failed to parse JWT header or payload.", statusCode: 401 };
-  }
-
-  // Algorithm validation: "none" is always rejected, then enforce allowlist.
-  // Default to RS256-only; callers must explicitly opt in to HS256.
-  if (!header.alg || header.alg === "none") {
-    return { valid: false, error: "Unsupported or disallowed algorithm: none.", statusCode: 401 };
-  }
-
-  const allowedAlgs = config.allowedAlgorithms ?? ["RS256"];
-  if (!allowedAlgs.includes(header.alg)) {
-    return { valid: false, error: `Unsupported or disallowed algorithm: ${header.alg}.`, statusCode: 401 };
-  }
-
-  // Signature verification
-  const signedData = `${headerB64}.${payloadB64}`;
-  const signature = Buffer.from(signatureB64, "base64url");
-
-  let signatureValid = false;
-  try {
-    if (header.alg === "RS256") {
-      const verifier = crypto.createVerify("RSA-SHA256");
-      verifier.update(signedData);
-      signatureValid = verifier.verify(config.publicKeyOrSecret, signature);
-    } else if (header.alg === "HS256") {
-      // HS256 requires a string secret; reject non-string keys for symmetric verification.
-      if (typeof config.publicKeyOrSecret !== "string" || config.publicKeyOrSecret.length === 0) {
-        return { valid: false, error: "HS256 requires a non-empty string secret in publicKeyOrSecret.", statusCode: 401 };
-      }
-      const hmac = crypto.createHmac("sha256", config.publicKeyOrSecret);
-      hmac.update(signedData);
-      const expectedSignature = hmac.digest();
-      // timingSafeEqual requires equal-length buffers; signature may be truncated by attacker.
-      if (expectedSignature.length !== signature.length) {
-        signatureValid = false;
-      } else {
-        signatureValid = crypto.timingSafeEqual(expectedSignature, signature);
-      }
-    }
-    // Any other algorithm that passed allowedAlgs check but is not implemented
-    // stays signatureValid=false and will be rejected below.
-  } catch (err) {
-    return { valid: false, error: `Cryptographic verification error: ${err instanceof Error ? err.message : String(err)}`, statusCode: 401 };
-  }
-
-  if (!signatureValid) {
-    return { valid: false, error: "Invalid token signature.", statusCode: 401 };
-  }
-
+function verifyPayloadClaims(
+  payload: JwtPayload,
+  config: BaseJwtVerifierConfig,
+  now: Date
+): JwtVerificationResult {
   // Issuer validation
   if (payload.iss !== config.expectedIssuer) {
     return { valid: false, error: `Invalid issuer: expected ${config.expectedIssuer}, got ${payload.iss}.`, statusCode: 401 };
@@ -198,4 +143,193 @@ export function verifyJwtToken(token: string, config: JwtVerifierConfig, now: Da
       }
     }
   };
+}
+
+function verifySignature(
+  alg: string,
+  key: string | crypto.KeyObject,
+  signedData: string,
+  signature: Buffer
+): boolean {
+  if (alg === "RS256") {
+    const verifier = crypto.createVerify("RSA-SHA256");
+    verifier.update(signedData);
+    return verifier.verify(key, signature);
+  }
+
+  if (alg === "ES256") {
+    const verifier = crypto.createVerify("SHA256");
+    verifier.update(signedData);
+    if (typeof key === "string") {
+      return verifier.verify({ key, dsaEncoding: "ieee-p1363" }, signature);
+    }
+    return verifier.verify({ key, dsaEncoding: "ieee-p1363" }, signature);
+  }
+
+  if (alg === "HS256") {
+    if (typeof key !== "string" || key.length === 0) {
+      return false;
+    }
+    const hmac = crypto.createHmac("sha256", key);
+    hmac.update(signedData);
+    const expectedSignature = hmac.digest();
+    if (expectedSignature.length !== signature.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expectedSignature, signature);
+  }
+
+  return false;
+}
+
+export function verifyJwtTokenSync(
+  token: string,
+  config: StaticJwtVerifierConfig,
+  now: Date = new Date()
+): JwtVerificationResult {
+  if (typeof token !== "string" || token.trim().length === 0) {
+    return { valid: false, error: "Missing or empty token.", statusCode: 401 };
+  }
+
+  const parts = token.trim().split(".");
+  if (parts.length !== 3) {
+    return { valid: false, error: "Malformed JWT token structure.", statusCode: 401 };
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+
+  let header: JwtHeader;
+  let payload: JwtPayload;
+
+  try {
+    header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8"));
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return { valid: false, error: "Failed to parse JWT header or payload.", statusCode: 401 };
+  }
+
+  // Never trust token-supplied key URLs
+  if (header.jku || header.x5u) {
+    return { valid: false, error: "Token header contains forbidden URL claim (jku/x5u).", statusCode: 401 };
+  }
+
+  if (!header.alg || header.alg === "none") {
+    return { valid: false, error: "Unsupported or disallowed algorithm: none.", statusCode: 401 };
+  }
+
+  const allowedAlgs = config.allowedAlgorithms ?? ["RS256"];
+  if (!allowedAlgs.includes(header.alg)) {
+    return { valid: false, error: `Unsupported or disallowed algorithm: ${header.alg}.`, statusCode: 401 };
+  }
+
+  if (header.alg === "HS256" && (typeof config.publicKeyOrSecret !== "string" || config.publicKeyOrSecret.length === 0)) {
+    return { valid: false, error: "HS256 requires a non-empty string secret in publicKeyOrSecret.", statusCode: 401 };
+  }
+
+  const signedData = `${headerB64}.${payloadB64}`;
+  const signature = Buffer.from(signatureB64, "base64url");
+
+  let signatureValid = false;
+  try {
+    signatureValid = verifySignature(header.alg, config.publicKeyOrSecret, signedData, signature);
+  } catch (err) {
+    return { valid: false, error: `Cryptographic verification error: ${err instanceof Error ? err.message : String(err)}`, statusCode: 401 };
+  }
+
+  if (!signatureValid) {
+    return { valid: false, error: "Invalid token signature.", statusCode: 401 };
+  }
+
+  return verifyPayloadClaims(payload, config, now);
+}
+
+export async function verifyJwtTokenAsync(
+  token: string,
+  config: JwksJwtVerifierConfig,
+  now: Date = new Date()
+): Promise<JwtVerificationResult> {
+  if (typeof token !== "string" || token.trim().length === 0) {
+    return { valid: false, error: "Missing or empty token.", statusCode: 401 };
+  }
+
+  const parts = token.trim().split(".");
+  if (parts.length !== 3) {
+    return { valid: false, error: "Malformed JWT token structure.", statusCode: 401 };
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+
+  let header: JwtHeader;
+  let payload: JwtPayload;
+
+  try {
+    header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8"));
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return { valid: false, error: "Failed to parse JWT header or payload.", statusCode: 401 };
+  }
+
+  // Never trust token-supplied key URLs
+  if (header.jku || header.x5u) {
+    return { valid: false, error: "Token header contains forbidden URL claim (jku/x5u).", statusCode: 401 };
+  }
+
+  if (!header.alg || header.alg === "none") {
+    return { valid: false, error: "Unsupported or disallowed algorithm: none.", statusCode: 401 };
+  }
+
+  // Reject symmetric algorithms in JWKS mode unconditionally
+  if (header.alg === "HS256") {
+    return { valid: false, error: "Symmetric algorithm HS256 is not permitted in JWKS mode.", statusCode: 401 };
+  }
+
+  const allowedAlgs = config.allowedAlgorithms ?? ["RS256", "ES256"];
+  if (!allowedAlgs.includes(header.alg)) {
+    return { valid: false, error: `Unsupported or disallowed algorithm: ${header.alg}.`, statusCode: 401 };
+  }
+
+  let resolvedKey: { key: crypto.KeyObject; alg?: string } | null;
+  try {
+    resolvedKey = await config.keyResolver.resolveKey({
+      alg: header.alg,
+      kid: header.kid
+    });
+  } catch (err) {
+    return { valid: false, error: `Key resolution error: ${err instanceof Error ? err.message : String(err)}`, statusCode: 401 };
+  }
+
+  if (!resolvedKey) {
+    return { valid: false, error: "Signing key not found in JWKS or key lookup was throttled.", statusCode: 401 };
+  }
+
+  const signedData = `${headerB64}.${payloadB64}`;
+  const signature = Buffer.from(signatureB64, "base64url");
+
+  let signatureValid = false;
+  try {
+    signatureValid = verifySignature(header.alg, resolvedKey.key, signedData, signature);
+  } catch (err) {
+    return { valid: false, error: `Cryptographic verification error: ${err instanceof Error ? err.message : String(err)}`, statusCode: 401 };
+  }
+
+  if (!signatureValid) {
+    return { valid: false, error: "Invalid token signature.", statusCode: 401 };
+  }
+
+  return verifyPayloadClaims(payload, config, now);
+}
+
+// Overload signatures for backward-compatible ergonomic consumption
+export function verifyJwtToken(token: string, config: StaticJwtVerifierConfig, now?: Date): JwtVerificationResult;
+export function verifyJwtToken(token: string, config: JwksJwtVerifierConfig, now?: Date): Promise<JwtVerificationResult>;
+export function verifyJwtToken(token: string, config: JwtVerifierConfig, now?: Date): JwtVerificationResult | Promise<JwtVerificationResult>;
+export function verifyJwtToken(
+  token: string,
+  config: JwtVerifierConfig,
+  now: Date = new Date()
+): JwtVerificationResult | Promise<JwtVerificationResult> {
+  if ("keyResolver" in config && config.keyResolver) {
+    return verifyJwtTokenAsync(token, config, now);
+  }
+  return verifyJwtTokenSync(token, config as StaticJwtVerifierConfig, now);
 }

@@ -126,14 +126,14 @@ export class CloudPilotApiServer {
     });
   }
 
-  private authenticate(req: http.IncomingMessage): AuthenticatedIdentity | null {
+  private async authenticate(req: http.IncomingMessage): Promise<AuthenticatedIdentity | null> {
     const authHeader = req.headers["authorization"];
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return null;
     }
 
     const token = authHeader.slice("Bearer ".length).trim();
-    const result = verifyJwtToken(token, this.jwtConfig);
+    const result = await verifyJwtToken(token, this.jwtConfig);
     if (!result.valid || !result.securityContext) {
       return null;
     }
@@ -172,7 +172,7 @@ export class CloudPilotApiServer {
       return;
     }
 
-    const identity = this.authenticate(req);
+    const identity = await this.authenticate(req);
     if (!identity) {
       this.sendJson(res, 401, { error: "Unauthorized: Missing, invalid, or expired authentication token." });
       return;
@@ -325,7 +325,8 @@ export class CloudPilotApiServer {
         scan = await this.scanRepo.create({
           tenantId,
           projectId,
-          triggeredById: identity.userId
+          triggeredById: identity.userId,
+          modelOverride: body.modelOverride
         });
       } catch (createErr) {
         if (createErr instanceof ActiveScanConflictError) {
