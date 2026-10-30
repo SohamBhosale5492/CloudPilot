@@ -54,4 +54,10 @@ A phase is complete only when acceptance evidence exists and the completion repo
 - Architecture, schema, endpoints, and limitations are documented in `phase-06/README.md`.
 - Phase 06 remains pending human review and is not marked complete by this note.
 
+## Phase 07 implementation notes
+- Automated GitHub remediation via sandbox branches and pull requests.
+- Enforces deterministic, minimal, allowlisted patches (`metric`, `health`, `alert`), path traversal prevention, and idempotency at both PostgreSQL and GitHub levels.
+- Architecture, schema, security controls, and failure paths are documented in `phase-07/README.md`.
+- Phase 07 remains pending human review and is not marked complete by this note.
+
 Keep pull requests small. Use a sandbox repository for write integrations. Never use production credentials in development. Record deviations in `DECISIONS.md`. Cloud deployment follows reliable local behavior.
