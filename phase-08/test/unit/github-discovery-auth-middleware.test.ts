@@ -1,0 +1,26 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { CloudPilotApiServer } from "../../../phase-06/src/api/server.js";
+import { mintTestJwt, TEST_ISSUER, TEST_AUDIENCE, TEST_PUBLIC_KEY } from "../../../phase-06/test/jwt-signer.js";
+import { GitHubInstallationRepositoriesApi } from "../../src/api/github-installation-repositories-api.js";
+import type { IdentityResolver } from "../../src/identity/identity-resolver.js";
+
+function corruptSignature(token:string):string{const parts=token.split(".");const bytes=Buffer.from(parts[2],"base64url");bytes[0]^=1;parts[2]=bytes.toString("base64url");return parts.join(".");}
+
+test("real Phase 06 middleware rejects missing, malformed, bad-signature, wrong issuer/audience, expired, and missing-exp JWTs before discovery",async()=>{
+ let githubCalls=0,identityCalls=0;const identity={async resolve(){identityCalls++;return{id:"local"};}} as unknown as IdentityResolver;
+ const auth={async installations(){return[];},async resolve(){return{githubInstallationId:1n};}} as never;const github={async list(){githubCalls++;return{repositories:[],hasNextPage:false};}} as never;
+ const route=new GitHubInstallationRepositoriesApi(identity,auth,github,{expectedIssuer:TEST_ISSUER,allowFirstUseProvisioning:false});const server=new CloudPilotApiServer({prisma:{} as never,jwtConfig:{expectedIssuer:TEST_ISSUER,expectedAudience:TEST_AUDIENCE,publicKeyOrSecret:TEST_PUBLIC_KEY},scanRunner:{async initialize(){},async shutdown(){}} as never,routeExtensions:[route]});const port=await server.start(0,"127.0.0.1");
+ const org="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",record="11111111-1111-4111-8111-111111111111";const paths=[`/api/v1/organizations/${org}/github/installations`,`/api/v1/organizations/${org}/github/installations/${record}/repositories`];
+ try{for(const path of paths){const missingExp=mintTestJwt({customClaims:{exp:undefined}});const past=JSON.parse(Buffer.from(mintTestJwt({expSecondsFromNow:-60}).split(".")[1],"base64url").toString("utf8")) as {exp:number};assert.ok(past.exp<Math.floor(Date.now()/1000));const bad=[undefined,"Bearer malformed",`Bearer ${corruptSignature(mintTestJwt())}`,`Bearer ${mintTestJwt({iss:"https://wrong-issuer"})}`,`Bearer ${mintTestJwt({aud:"wrong-audience"})}`,`Bearer ${mintTestJwt({expSecondsFromNow:-60})}`,`Bearer ${missingExp}`];for(let i=0;i<bad.length;i++){const header=bad[i];const response=await fetch(`http://127.0.0.1:${port}${path}`,{headers:header?{authorization:header,connection:"close"}:{connection:"close"}});assert.equal(response.status,401,`path=${path} authCase=${i}`);const text=await response.text();assert.doesNotMatch(text,/Bearer|different signing|wrong-issuer|wrong-audience|private.?key/i);}}assert.equal(identityCalls,0);assert.equal(githubCalls,0);}finally{await server.stop();}
+});
+
+test("verified JWT reaches both discovery routes; local identity and role denials precede GitHub",async()=>{
+ let localStatus:"active"|"inactive"|"missing"="active",role:string="viewer",calls=0;const identity={async resolve(){if(localStatus==="missing")throw new Error("not provisioned");return{id:"local",status:localStatus};}} as unknown as IdentityResolver;
+ const auth={async installations(){if(localStatus!=="active"||role==="denied")return null;return[];},async resolve(){if(localStatus!=="active"||role==="denied")return null;return{githubInstallationId:1n};}} as never;const github={async list(){calls++;return{repositories:[],hasNextPage:false};}} as never;
+ const route=new GitHubInstallationRepositoriesApi(identity,auth,github,{expectedIssuer:TEST_ISSUER,allowFirstUseProvisioning:false});const server=new CloudPilotApiServer({prisma:{} as never,jwtConfig:{expectedIssuer:TEST_ISSUER,expectedAudience:TEST_AUDIENCE,publicKeyOrSecret:TEST_PUBLIC_KEY},scanRunner:{async initialize(){},async shutdown(){}} as never,routeExtensions:[route]});const port=await server.start(0,"127.0.0.1");const org="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",record="11111111-1111-4111-8111-111111111111",token=mintTestJwt({iss:TEST_ISSUER,aud:TEST_AUDIENCE,sub:"verified-sub",roles:["viewer"]});
+ try{for(const path of [`/api/v1/organizations/${org}/github/installations`,`/api/v1/organizations/${org}/github/installations/${record}/repositories`]){const response=await fetch(`http://127.0.0.1:${port}${path}`,{headers:{authorization:`Bearer ${token}`,connection:"close"}});assert.equal(response.status,200);const withinSkew=mintTestJwt({expSecondsFromNow:-10});assert.equal((await fetch(`http://127.0.0.1:${port}${path}`,{headers:{authorization:`Bearer ${withinSkew}`,connection:"close"}})).status,200);}
+ for(const status of ["missing","inactive"] as const){localStatus=status;for(const path of [`/api/v1/organizations/${org}/github/installations`,`/api/v1/organizations/${org}/github/installations/${record}/repositories`]){assert.notEqual((await fetch(`http://127.0.0.1:${port}${path}`,{headers:{authorization:`Bearer ${token}`,connection:"close"}})).status,200);}}
+ localStatus="active";role="denied";const denied=await fetch(`http://127.0.0.1:${port}/api/v1/organizations/${org}/github/installations/${record}/repositories`,{headers:{authorization:`Bearer ${token}`,connection:"close"}});assert.equal(denied.status,404);assert.equal(calls,2);
+ }finally{await server.stop();}
+});

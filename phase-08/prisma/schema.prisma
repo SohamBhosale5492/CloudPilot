@@ -1,0 +1,591 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ── Models ───────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  projects                Project[]
+  users                   User[]
+  auditEvents             AuditEvent[]
+  remediations            Remediation[]
+  projectAdoptions        ProjectOrganizationAdoption[]
+  organizationAuditEvents OrganizationAuditEvent[]
+  remediationExecutions  RemediationExecution[]
+
+  @@map("tenants")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  email     String
+  role      String // "admin" | "operator" | "viewer"
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@map("users")
+}
+
+model Project {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  organizationId String?  @map("organization_id") @db.Uuid
+  name           String
+  repositoryUrl  String?  @map("repository_url")
+  expectedModel  Json?    @map("expected_model")
+  targetConfig   Json?    @map("target_config")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant                   Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  organization             Organization?                 @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  scans                    Scan[]
+  remediations             Remediation[]
+  organizationRemediations Remediation[]                 @relation("RemediationOrganizationProject")
+  adoptions                ProjectOrganizationAdoption[]
+  organizationAuditEvents  AuditEvent[]                  @relation("AuditEventOrganizationProject")
+  organizationEvents       OrganizationAuditEvent[]      @relation("OrganizationAuditProject")
+  githubRepositoryBindings ProjectGitHubRepository[]
+  remediationExecutions   RemediationExecution[]
+
+  @@unique([tenantId, name])
+  @@unique([tenantId, id])
+  @@unique([tenantId, organizationId, id], map: "uq_projects_tenant_org_id")
+  @@map("projects")
+}
+
+model Scan {
+  id             String    @id @default(uuid())
+  tenantId       String    @map("tenant_id")
+  organizationId String?   @map("organization_id") @db.Uuid
+  projectId      String    @map("project_id")
+  status         String // "pending" | "running" | "completed" | "failed"
+  triggeredById  String?   @map("triggered_by_id")
+  startedAt      DateTime? @map("started_at")
+  completedAt    DateTime? @map("completed_at")
+  error          String?
+  workerId       String?   @map("worker_id")
+  leaseToken     String?   @map("lease_token") @db.Uuid
+  claimedAt      DateTime? @map("claimed_at")
+  heartbeatAt    DateTime? @map("heartbeat_at")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  attemptCount   Int       @default(0) @map("attempt_count")
+  maxAttempts    Int       @default(3) @map("max_attempts")
+  modelOverride  Json?     @map("model_override")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  project                  Project       @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
+  organization             Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  findings                 Finding[]
+  remediations             Remediation[]
+  organizationRemediations Remediation[] @relation("RemediationOrganizationScan")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, organizationId, projectId, id], map: "uq_scans_tenant_org_project_id")
+  @@index([tenantId, projectId, createdAt(sort: Desc)])
+  @@index([leaseExpiresAt], map: "idx_scans_lease_expires")
+  @@map("scans")
+}
+
+model Finding {
+  id             String   @id @default(uuid())
+  tenantId       String   @map("tenant_id")
+  organizationId String?  @map("organization_id") @db.Uuid
+  projectId      String   @map("project_id")
+  scanId         String   @map("scan_id")
+  attemptNumber  Int      @default(1) @map("attempt_number")
+  requirementId  String   @map("requirement_id")
+  ruleId         String   @map("rule_id")
+  ruleVersion    String   @map("rule_version")
+  signal         String // "metric" | "health" | "log" | "trace" | "alert"
+  outcome        String // "pass" | "gap" | "unknown" | "inconclusive"
+  expected       String
+  observed       String
+  reason         String
+  evidenceJson   Json     @map("evidence_json")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  scan                     Scan          @relation(fields: [tenantId, scanId], references: [tenantId, id], onDelete: Cascade)
+  organization             Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  remediations             Remediation[]
+  organizationRemediations Remediation[] @relation("RemediationOrganizationFinding")
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, organizationId, projectId, scanId, id], map: "uq_findings_tenant_org_project_scan_id")
+  @@index([tenantId, scanId])
+  @@index([tenantId, scanId, attemptNumber], map: "idx_findings_scan_attempt")
+  @@map("findings")
+}
+
+model AuditEvent {
+  id                  String   @id @default(uuid())
+  tenantId            String   @map("tenant_id")
+  organizationId      String?  @map("organization_id") @db.Uuid
+  projectId           String?  @map("project_id")
+  actorId             String   @map("actor_id")
+  actorIdentityUserId String?  @map("actor_identity_user_id") @db.Uuid
+  adoptionId          String?  @map("adoption_id") @db.Uuid
+  action              String
+  resourceType        String   @map("resource_type")
+  resourceId          String   @map("resource_id")
+  metadataJson        Json?    @map("metadata_json")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  tenant              Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  organization        Organization?                @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  actorIdentityUser   IdentityUser?                @relation("AuditIdentityActor", fields: [actorIdentityUserId], references: [id], onDelete: Restrict)
+  adoption            ProjectOrganizationAdoption? @relation("AdoptionLegacyAudit", fields: [adoptionId], references: [id], onDelete: Restrict)
+  organizationProject Project?                     @relation("AuditEventOrganizationProject", fields: [tenantId, organizationId, projectId], references: [tenantId, organizationId, id], onDelete: Restrict)
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@map("audit_events")
+}
+
+model Remediation {
+  id             String  @id @default(uuid())
+  tenantId       String  @map("tenant_id")
+  organizationId String? @map("organization_id") @db.Uuid
+  projectId      String  @map("project_id")
+  scanId         String  @map("scan_id")
+  findingId      String  @map("finding_id")
+
+  // Stage 3E.3 proposal identity is nullable only for historical rows. New
+  // proposals populate the complete context atomically; legacy rows are not
+  // backfilled with guessed requester or approval data.
+  requestedByIdentityUserId String?  @map("requested_by_identity_user_id") @db.Uuid
+  repositoryBindingId       String?  @map("repository_binding_id") @db.Uuid
+  githubRepositoryId        BigInt?  @map("github_repository_id")
+  planHash                  String?  @map("plan_hash") @db.VarChar(64)
+  planSnapshot              Json?    @map("plan_snapshot") @db.JsonB
+  executionArtifact         Json?    @map("execution_artifact") @db.JsonB
+  executionArtifactHash     String?  @map("execution_artifact_hash") @db.VarChar(64)
+  approvedArtifactHash      String?  @map("approved_artifact_hash") @db.VarChar(64)
+  approvalState             String?  @map("approval_state") @db.VarChar(16)
+  approvedByIdentityUserId  String?  @map("approved_by_identity_user_id") @db.Uuid
+  approvedAt                DateTime? @map("approved_at")
+  rejectedByIdentityUserId  String?  @map("rejected_by_identity_user_id") @db.Uuid
+  rejectedAt                DateTime? @map("rejected_at")
+  invalidatedByIdentityUserId String? @map("invalidated_by_identity_user_id") @db.Uuid
+  invalidatedAt             DateTime? @map("invalidated_at")
+
+  // Idempotency key: finding + patch path + rule version
+  idempotencyKey String @unique @map("idempotency_key")
+
+  status       String // includes "pending_approval"; existing execution statuses remain unchanged
+  branchName   String? @map("branch_name")
+  prNumber     Int?    @map("pr_number")
+  prUrl        String? @map("pr_url")
+  patchSummary String? @map("patch_summary")
+  errorMessage String? @map("error_message")
+  retriesLeft  Int     @default(3) @map("retries_left")
+
+  // Worker lease coordination & retry scheduling (Phase 08)
+  workerId       String?   @map("worker_id")
+  leaseToken     String?   @map("lease_token") @db.Uuid
+  claimedAt      DateTime? @map("claimed_at")
+  heartbeatAt    DateTime? @map("heartbeat_at")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  nextAttemptAt  DateTime? @map("next_attempt_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  organization        Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  project             Project       @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
+  scan                Scan          @relation(fields: [tenantId, scanId], references: [tenantId, id], onDelete: Cascade)
+  finding             Finding       @relation(fields: [tenantId, findingId], references: [tenantId, id], onDelete: Cascade)
+  organizationProject Project?      @relation("RemediationOrganizationProject", fields: [tenantId, organizationId, projectId], references: [tenantId, organizationId, id], onDelete: Cascade)
+  organizationScan    Scan?         @relation("RemediationOrganizationScan", fields: [tenantId, organizationId, projectId, scanId], references: [tenantId, organizationId, projectId, id], onDelete: Cascade)
+  organizationFinding Finding?      @relation("RemediationOrganizationFinding", fields: [tenantId, organizationId, projectId, scanId, findingId], references: [tenantId, organizationId, projectId, scanId, id], onDelete: Cascade)
+  requestedBy           IdentityUser? @relation("RemediationRequester", fields: [requestedByIdentityUserId], references: [id], onDelete: Restrict, map: "remediations_requester_fkey")
+  approvedBy            IdentityUser? @relation("RemediationApprover", fields: [approvedByIdentityUserId], references: [id], onDelete: Restrict, map: "remediations_approver_fkey")
+  rejectedBy            IdentityUser? @relation("RemediationRejector", fields: [rejectedByIdentityUserId], references: [id], onDelete: Restrict, map: "remediations_rejector_fkey")
+  invalidatedBy         IdentityUser? @relation("RemediationInvalidator", fields: [invalidatedByIdentityUserId], references: [id], onDelete: Restrict, map: "remediations_invalidator_fkey")
+  repositoryBinding     ProjectGitHubRepository? @relation("RemediationRepositoryBinding", fields: [tenantId, organizationId, projectId, repositoryBindingId, githubRepositoryId], references: [tenantId, organizationId, projectId, id, githubRepositoryId], onDelete: Restrict, map: "remediations_repository_binding_fkey")
+  execution             RemediationExecution?
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, organizationId, projectId, id], map: "uq_remediations_execution_scope")
+  @@index([tenantId, projectId, createdAt(sort: Desc)], map: "idx_remediations_tenant_project")
+  @@index([tenantId, scanId], map: "idx_remediations_tenant_scan")
+  @@index([status], map: "idx_remediations_status")
+  @@index([leaseExpiresAt], map: "idx_remediations_lease_expires")
+  @@index([nextAttemptAt], map: "idx_remediations_next_attempt")
+  @@index([organizationId, approvalState, createdAt(sort: Desc)], map: "idx_remediations_approval_inbox")
+  @@index([requestedByIdentityUserId, createdAt(sort: Desc)], map: "idx_remediations_requested_by")
+  @@index([repositoryBindingId], map: "idx_remediations_repository_binding")
+  @@map("remediations")
+}
+
+// SaaS identities are deliberately separate from the legacy tenant-scoped User model.
+model IdentityUser {
+  id                  String    @id @default(uuid()) @db.Uuid
+  status              String    @default("active")
+  displayName         String?   @map("display_name")
+  email               String?
+  emailVerifiedAt     DateTime? @map("email_verified_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  lastAuthenticatedAt DateTime? @map("last_authenticated_at")
+
+  externalIdentities   ExternalIdentity[]
+  memberships          OrganizationMember[]          @relation("MemberUser")
+  createdOrganizations Organization[]                @relation("OrganizationCreator")
+  createdMemberships   OrganizationMember[]          @relation("MembershipCreator")
+  organizationAudits   OrganizationAuditEvent[]      @relation("OrganizationAuditActor")
+  legacyAuditEvents    AuditEvent[]                  @relation("AuditIdentityActor")
+  requestedAdoptions   ProjectOrganizationAdoption[] @relation("AdoptionRequester")
+  approvedAdoptions    ProjectOrganizationAdoption[] @relation("AdoptionApprover")
+  githubInstallationsConnected OrganizationGitHubInstallation[] @relation("GitHubInstallationConnector")
+  githubRepositoriesConnected ProjectGitHubRepository[] @relation("GitHubRepositoryConnector")
+  remediationExecutionEvents RemediationExecutionEvent[] @relation("RemediationExecutionEventActor")
+  remediationExecutionsReconciled RemediationExecution[] @relation("RemediationExecutionReconciler")
+  githubConnectIntents GitHubConnectIntent[] @relation("GitHubConnectInitiator")
+  requestedRemediations Remediation[] @relation("RemediationRequester")
+  approvedRemediations Remediation[] @relation("RemediationApprover")
+  rejectedRemediations Remediation[] @relation("RemediationRejector")
+  invalidatedRemediations Remediation[] @relation("RemediationInvalidator")
+
+  @@index([status, createdAt(sort: Desc)], map: "idx_identity_users_status_created")
+  @@map("identity_users")
+}
+
+model ExternalIdentity {
+  id                  String    @id @default(uuid()) @db.Uuid
+  userId              String    @map("user_id") @db.Uuid
+  issuer              String
+  subject             String
+  createdAt           DateTime  @default(now()) @map("created_at")
+  lastAuthenticatedAt DateTime? @map("last_authenticated_at")
+
+  user IdentityUser @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([issuer, subject], map: "uq_external_identities_issuer_subject")
+  @@index([userId], map: "idx_external_identities_user")
+  @@map("external_identities")
+}
+
+model Organization {
+  id                     String   @id @default(uuid()) @db.Uuid
+  displayName            String   @map("display_name")
+  status                 String   @default("active")
+  createdByUserId        String   @map("created_by_user_id") @db.Uuid
+  creationIdempotencyKey String   @map("creation_idempotency_key") @db.VarChar(128)
+  creationRequestHash    String   @map("creation_request_hash") @db.Char(64)
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  createdBy         IdentityUser                  @relation("OrganizationCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  memberships       OrganizationMember[]
+  auditEvents       OrganizationAuditEvent[]
+  githubInstallations OrganizationGitHubInstallation[]
+  githubConnectIntents GitHubConnectIntent[]
+  githubWebhookDeliveries GitHubWebhookDelivery[]
+  ownedProjects     Project[]
+  projectAdoptions  ProjectOrganizationAdoption[]
+  auditEventsLegacy AuditEvent[]
+  remediations      Remediation[]
+  remediationExecutions RemediationExecution[]
+  scans             Scan[]
+  findings          Finding[]
+
+  @@unique([createdByUserId, creationIdempotencyKey], map: "uq_organizations_creator_idempotency")
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)], map: "idx_organizations_status_created")
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  organizationId  String    @map("organization_id") @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  role            String
+  status          String    @default("active")
+  createdByUserId String    @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  revokedAt       DateTime? @map("revoked_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  user         IdentityUser @relation("MemberUser", fields: [userId], references: [id], onDelete: Restrict)
+  createdBy    IdentityUser @relation("MembershipCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@id([organizationId, userId], map: "pk_organization_members")
+  @@index([userId, status, organizationId], map: "idx_org_members_user_status")
+  @@index([organizationId, status, role, userId], map: "idx_org_members_org_role")
+  @@map("organization_members")
+}
+
+model OrganizationAuditEvent {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  tenantId       String?  @map("tenant_id")
+  projectId      String?  @map("project_id")
+  adoptionId     String?  @map("adoption_id") @db.Uuid
+  actorType      String   @default("user") @map("actor_type") @db.VarChar(16)
+  actorUserId    String?  @map("actor_user_id") @db.Uuid
+  systemActorId  String?  @map("system_actor_id") @db.VarChar(64)
+  action         String
+  targetType     String   @map("target_type")
+  targetId       String   @map("target_id")
+  metadata       Json
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization        Organization                 @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  tenant              Tenant?                      @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  actor               IdentityUser?                @relation("OrganizationAuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  adoption            ProjectOrganizationAdoption? @relation("AdoptionOrganizationAudit", fields: [adoptionId], references: [id], onDelete: Restrict)
+  organizationProject Project?                     @relation("OrganizationAuditProject", fields: [tenantId, organizationId, projectId], references: [tenantId, organizationId, id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt(sort: Desc), id(sort: Desc)], map: "idx_org_audit_org_created")
+  @@index([organizationId, targetType, targetId], map: "idx_org_audit_target")
+  @@index([organizationId, actorType, createdAt(sort: Desc)], map: "idx_org_audit_actor_type_created")
+  @@map("organization_audit_events")
+}
+
+model ProjectOrganizationAdoption {
+  id                        String    @id @default(uuid()) @db.Uuid
+  tenantId                  String    @map("tenant_id")
+  projectId                 String    @map("project_id")
+  organizationId            String    @map("organization_id") @db.Uuid
+  requestedByIdentityUserId String    @map("requested_by_identity_user_id") @db.Uuid
+  approvedByIdentityUserId  String?   @map("approved_by_identity_user_id") @db.Uuid
+  status                    String    @default("pending")
+  approvedAt                DateTime? @map("approved_at")
+  rejectedAt                DateTime? @map("rejected_at")
+  revokedAt                 DateTime? @map("revoked_at")
+  idempotencyKey            String    @map("idempotency_key") @db.VarChar(128)
+  requestHash               String    @map("request_hash") @db.Char(64)
+  provenance                Json
+  createdAt                 DateTime  @default(now()) @map("created_at")
+  updatedAt                 DateTime  @updatedAt @map("updated_at")
+
+  tenant                  Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  project                 Project                  @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Restrict)
+  organization            Organization             @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requestedBy             IdentityUser             @relation("AdoptionRequester", fields: [requestedByIdentityUserId], references: [id], onDelete: Restrict)
+  approvedBy              IdentityUser?            @relation("AdoptionApprover", fields: [approvedByIdentityUserId], references: [id], onDelete: Restrict)
+  legacyAuditEvents       AuditEvent[]             @relation("AdoptionLegacyAudit")
+  organizationAuditEvents OrganizationAuditEvent[] @relation("AdoptionOrganizationAudit")
+
+  @@unique([requestedByIdentityUserId, idempotencyKey], map: "uq_project_adoptions_requester_idempotency")
+  @@unique([tenantId, organizationId, projectId, id], map: "uq_project_adoptions_tenant_org_project_id")
+  @@index([tenantId, projectId, createdAt(sort: Desc)], map: "idx_project_adoptions_project_created")
+  @@index([organizationId, status, createdAt(sort: Desc)], map: "idx_project_adoptions_org_status_created")
+  @@map("project_organization_adoptions")
+}
+
+model OrganizationGitHubInstallation {
+  id                      String    @id @default(uuid()) @db.Uuid
+  organizationId          String    @map("organization_id") @db.Uuid
+  githubInstallationId    BigInt    @unique(map: "uq_github_installations_github_id") @map("github_installation_id")
+  githubAccountId         BigInt    @map("github_account_id")
+  githubAccountLogin      String    @map("github_account_login") @db.VarChar(100)
+  githubAccountType       String    @map("github_account_type") @db.VarChar(32)
+  status                  String    @default("active") @db.VarChar(16)
+  verifiedPermissions    Json      @map("verified_permissions")
+  connectedByIdentityUserId String  @map("connected_by_identity_user_id") @db.Uuid
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+  verifiedAt              DateTime  @default(now()) @map("verified_at")
+  disconnectedAt          DateTime? @map("disconnected_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, map: "organization_github_installations_organization_id_fkey")
+  connectedBy  IdentityUser @relation("GitHubInstallationConnector", fields: [connectedByIdentityUserId], references: [id], onDelete: Restrict, map: "organization_github_installations_connected_by_fkey")
+  repositories ProjectGitHubRepository[]
+  remediationExecutions RemediationExecution[]
+
+  @@unique([organizationId, id], map: "uq_github_installations_org_id")
+  @@index([organizationId, status], map: "idx_github_installations_org_status")
+  @@index([connectedByIdentityUserId], map: "idx_github_installations_connected_by")
+  @@map("organization_github_installations")
+}
+
+model ProjectGitHubRepository {
+  id                          String    @id @default(uuid()) @db.Uuid
+  tenantId                    String    @map("tenant_id")
+  organizationId              String    @map("organization_id") @db.Uuid
+  projectId                   String    @map("project_id")
+  installationRecordId        String    @map("installation_record_id") @db.Uuid
+  githubRepositoryId          BigInt    @map("github_repository_id")
+  ownerLogin                  String    @map("owner_login") @db.VarChar(100)
+  repositoryName              String    @map("repository_name") @db.VarChar(100)
+  status                      String    @default("active") @db.VarChar(16)
+  connectedByIdentityUserId   String    @map("connected_by_identity_user_id") @db.Uuid
+  createdAt                   DateTime  @default(now()) @map("created_at")
+  updatedAt                   DateTime  @updatedAt @map("updated_at")
+  disconnectedAt              DateTime? @map("disconnected_at")
+
+  project      Project                         @relation(fields: [tenantId, organizationId, projectId], references: [tenantId, organizationId, id], onDelete: Restrict, map: "project_github_repositories_project_fkey")
+  installation OrganizationGitHubInstallation @relation(fields: [organizationId, installationRecordId], references: [organizationId, id], onDelete: Restrict, map: "project_github_repositories_installation_fkey")
+  connectedBy  IdentityUser                    @relation("GitHubRepositoryConnector", fields: [connectedByIdentityUserId], references: [id], onDelete: Restrict, map: "project_github_repositories_connected_by_fkey")
+  remediations Remediation[]                   @relation("RemediationRepositoryBinding")
+  remediationExecutions RemediationExecution[]
+
+  @@unique([tenantId, organizationId, projectId, id, githubRepositoryId], map: "uq_project_github_repo_remediation_ref")
+  // SQL-managed unique key used to bind an execution to this binding's exact installation.
+  @@unique([tenantId, organizationId, projectId, id, githubRepositoryId, installationRecordId], map: "uq_project_github_repo_installation_ref")
+  @@index([tenantId, organizationId, projectId, status], map: "idx_project_github_repos_project_status")
+  @@index([organizationId, status], map: "idx_project_github_repos_org_status")
+  @@index([installationRecordId], map: "idx_project_github_repos_installation")
+  @@index([organizationId, githubRepositoryId], map: "idx_project_github_repos_repo")
+  @@index([connectedByIdentityUserId], map: "idx_project_github_repos_connected_by")
+  @@map("project_github_repositories")
+}
+
+// CHECK constraints and the append-only execution-event trigger are intentionally
+// migration-managed under Prisma 5.22; verify their SQL definitions in lineage checks.
+model RemediationExecution {
+  id                       String    @id @default(uuid()) @db.Uuid
+  tenantId                 String    @map("tenant_id")
+  organizationId           String    @map("organization_id") @db.Uuid
+  projectId                String    @map("project_id")
+  remediationId            String    @map("remediation_id")
+  repositoryBindingId      String    @map("repository_binding_id") @db.Uuid
+  installationRecordId     String    @map("installation_record_id") @db.Uuid
+  githubRepositoryId       BigInt    @map("github_repository_id")
+  artifactHash             String    @map("artifact_hash") @db.VarChar(64)
+  baseRef                  String    @map("base_ref") @db.VarChar(255)
+  baseCommitSha            String    @map("base_commit_sha") @db.VarChar(40)
+  status                   String    @default("queued") @db.VarChar(32)
+  stage                    String?   @db.VarChar(32)
+  attemptNumber            Int       @default(1) @map("attempt_number")
+  version                  BigInt    @default(0)
+  leaseOwner               String?   @map("lease_owner") @db.VarChar(200)
+  leaseTokenHash           String?   @map("lease_token_hash") @db.Char(64)
+  leaseExpiresAt           DateTime? @map("lease_expires_at")
+  commitSha                String?   @map("commit_sha") @db.VarChar(40)
+  branchName               String?   @map("branch_name") @db.VarChar(255)
+  branchVerifiedAt         DateTime? @map("branch_verified_at")
+  pullRequestNumber        Int?      @map("pull_request_number")
+  pullRequestUrl           String?   @map("pull_request_url") @db.VarChar(2048)
+  pullRequestVerifiedAt    DateTime? @map("pull_request_verified_at")
+  failureStage             String?   @map("failure_stage") @db.VarChar(32)
+  failureCode              String?   @map("failure_code") @db.VarChar(64)
+  retryEligibleAt          DateTime? @map("retry_eligible_at")
+  startedAt                DateTime? @map("started_at")
+  commitVerifiedAt         DateTime? @map("commit_verified_at")
+  completedAt              DateTime? @map("completed_at")
+  manualReviewAt            DateTime? @map("manual_review_at")
+  reconciliationStatus     String    @default("not_required") @map("reconciliation_status") @db.VarChar(24)
+  reconciliationStartedAt  DateTime? @map("reconciliation_started_at")
+  reconciledAt              DateTime? @map("reconciled_at")
+  reconciliationOutcome    String?   @map("reconciliation_outcome") @db.VarChar(32)
+  reconciliationActorId    String?   @map("reconciliation_actor_id") @db.Uuid
+  reconciliationLeaseHash  String?   @map("reconciliation_lease_hash") @db.Char(64)
+  reconciliationLeaseUntil DateTime? @map("reconciliation_lease_until")
+  recoveryLeaseHash   String?   @map("recovery_lease_hash") @db.Char(64)
+  recoveryLeaseUntil DateTime? @map("recovery_lease_until")
+  recoveryLeaseOwner  String?   @map("recovery_lease_owner") @db.VarChar(200)
+  createdAt                DateTime  @default(now()) @map("created_at")
+  updatedAt                DateTime  @updatedAt @map("updated_at")
+
+  tenant           Tenant                        @relation(fields: [tenantId], references: [id], onDelete: Restrict, map: "remediation_executions_tenant_fkey")
+  organization     Organization                  @relation(fields: [organizationId], references: [id], onDelete: Restrict, map: "remediation_executions_organization_fkey")
+  project          Project                       @relation(fields: [tenantId, organizationId, projectId], references: [tenantId, organizationId, id], onDelete: Restrict, map: "remediation_executions_project_fkey")
+  remediation      Remediation                   @relation(fields: [tenantId, organizationId, projectId, remediationId], references: [tenantId, organizationId, projectId, id], onDelete: Restrict, map: "remediation_executions_remediation_fkey")
+  repositoryBinding ProjectGitHubRepository      @relation(fields: [tenantId, organizationId, projectId, repositoryBindingId, githubRepositoryId, installationRecordId], references: [tenantId, organizationId, projectId, id, githubRepositoryId, installationRecordId], onDelete: Restrict, map: "remediation_executions_binding_fkey")
+  installation    OrganizationGitHubInstallation @relation(fields: [organizationId, installationRecordId], references: [organizationId, id], onDelete: Restrict, map: "remediation_executions_installation_fkey")
+  reconciliationActor IdentityUser?              @relation("RemediationExecutionReconciler", fields: [reconciliationActorId], references: [id], onDelete: Restrict, map: "remediation_executions_reconcile_actor_fkey")
+  events          RemediationExecutionEvent[]
+
+  @@unique([tenantId, organizationId, projectId, remediationId], map: "uq_remediation_executions_proposal")
+  @@unique([tenantId, organizationId, projectId, remediationId, id], map: "uq_remediation_executions_scope_ref")
+  @@unique([githubRepositoryId, pullRequestNumber], map: "uq_remediation_executions_github_pr")
+  @@index([status, updatedAt], map: "idx_remediation_executions_status_updated")
+  @@index([organizationId, status, updatedAt], map: "idx_remediation_executions_org_status")
+  @@index([leaseExpiresAt], map: "idx_remediation_executions_lease_expiry")
+  @@index([recoveryLeaseUntil], map: "idx_remediation_executions_recovery_lease_expiry")
+  @@map("remediation_executions")
+}
+
+// INSERT-only journal. UPDATE/DELETE protection is enforced by the SQL trigger.
+model RemediationExecutionEvent {
+  id                 String   @id @default(uuid()) @db.Uuid
+  executionId        String   @map("execution_id") @db.Uuid
+  tenantId           String   @map("tenant_id")
+  organizationId     String   @map("organization_id") @db.Uuid
+  projectId          String   @map("project_id")
+  remediationId      String   @map("remediation_id")
+  attemptNumber      Int      @map("attempt_number")
+  sequenceNumber     Int      @map("sequence_number")
+  eventType          String   @map("event_type") @db.VarChar(48)
+  stage              String   @db.VarChar(32)
+  operationKey       String?  @map("operation_key") @db.VarChar(128)
+  requestHash        String?  @map("request_hash") @db.Char(64)
+  remoteResourceType String?  @map("remote_resource_type") @db.VarChar(32)
+  remoteResourceId   String?  @map("remote_resource_id") @db.VarChar(128)
+  commitSha          String?  @map("commit_sha") @db.VarChar(40)
+  branchName         String?  @map("branch_name") @db.VarChar(255)
+  pullRequestNumber  Int?     @map("pull_request_number")
+  pullRequestUrl     String?  @map("pull_request_url") @db.VarChar(2048)
+  errorCode          String?  @map("error_code") @db.VarChar(64)
+  actorType          String   @default("system") @map("actor_type") @db.VarChar(16)
+  actorUserId        String?  @map("actor_user_id") @db.Uuid
+  systemActorId      String?  @map("system_actor_id") @db.VarChar(64)
+  metadata           Json     @default("{}") @db.JsonB
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  execution RemediationExecution @relation(fields: [tenantId, organizationId, projectId, remediationId, executionId], references: [tenantId, organizationId, projectId, remediationId, id], onDelete: Restrict, map: "remediation_execution_events_execution_fkey")
+  actor     IdentityUser?        @relation("RemediationExecutionEventActor", fields: [actorUserId], references: [id], onDelete: Restrict, map: "remediation_execution_events_actor_fkey")
+  // SQL-managed composite FK additionally requires user actors to belong to the event organization.
+
+  @@unique([executionId, attemptNumber, sequenceNumber], map: "uq_remediation_execution_events_sequence")
+  @@unique([executionId, attemptNumber, operationKey, eventType], map: "uq_remediation_execution_events_operation")
+  @@index([tenantId, organizationId, projectId, remediationId, createdAt], map: "idx_remediation_execution_events_scope_time")
+  @@map("remediation_execution_events")
+}
+
+model GitHubConnectIntent {
+  id                       String    @id @default(uuid()) @db.Uuid
+  organizationId           String    @map("organization_id") @db.Uuid
+  initiatedByIdentityUserId String  @map("initiated_by_identity_user_id") @db.Uuid
+  stateHash                String    @unique(map: "uq_github_connect_intents_state_hash") @map("state_hash") @db.Char(64)
+  expiresAt                DateTime  @map("expires_at")
+  consumedAt               DateTime? @map("consumed_at")
+  createdAt                DateTime  @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, map: "github_connect_intents_organization_fkey")
+  initiatedBy  IdentityUser @relation("GitHubConnectInitiator", fields: [initiatedByIdentityUserId], references: [id], onDelete: Restrict, map: "github_connect_intents_user_fkey")
+
+  @@index([organizationId, expiresAt], map: "idx_github_connect_intents_org_expiry")
+  @@index([initiatedByIdentityUserId, expiresAt], map: "idx_github_connect_intents_user_expiry")
+  @@index([expiresAt], map: "idx_github_connect_intents_expiry")
+  @@map("github_connect_intents")
+}
+
+model GitHubWebhookDelivery {
+  id                    String    @id @default(uuid()) @db.Uuid
+  githubDeliveryId      String    @unique(map: "uq_github_webhook_deliveries_delivery_id") @map("github_delivery_id") @db.VarChar(128)
+  eventName             String    @map("event_name") @db.VarChar(100)
+  action                String?   @db.VarChar(100)
+  githubInstallationId  BigInt?   @map("github_installation_id")
+  githubRepositoryId    BigInt?   @map("github_repository_id")
+  organizationId        String?   @map("organization_id") @db.Uuid
+  payloadHash           String    @map("payload_hash") @db.Char(64)
+  status                String    @default("received") @db.VarChar(16)
+  attemptCount          Int       @default(0) @map("attempt_count")
+  receivedAt            DateTime  @default(now()) @map("received_at")
+  processedAt           DateTime? @map("processed_at")
+  safeErrorCode         String?   @map("safe_error_code") @db.VarChar(64)
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict, map: "github_webhook_deliveries_organization_fkey")
+
+  @@index([githubInstallationId, receivedAt(sort: Desc)], map: "idx_github_webhook_install_received")
+  @@index([githubRepositoryId, receivedAt(sort: Desc)], map: "idx_github_webhook_repo_received")
+  @@index([organizationId, receivedAt(sort: Desc)], map: "idx_github_webhook_org_received")
+  @@index([status, receivedAt], map: "idx_github_webhook_status_received")
+  @@index([receivedAt], map: "idx_github_webhook_received")
+  @@map("github_webhook_deliveries")
+}

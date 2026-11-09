@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "rootDir": "..",
+    "outDir": "./dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": false
+  },
+  "include": [
+    "src/**/*",
+    "test/**/*",
+    "../phase-07/src/**/*",
+    "../phase-06/src/**/*",
+    "../phase-01/demo-service/src/expected-observability.ts",
+    "../phase-01/demo-service/src/architecture-discovery.ts",
+    "../phase-01/demo-service/src/gap-engine.ts",
+    "../phase-01/demo-service/src/inspectors.ts",
+    "../phase-01/demo-service/src/evaluation.ts",
+    "../phase-01/demo-service/src/prometheus-evidence.ts"
+  ]
+}

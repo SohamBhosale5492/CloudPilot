@@ -58,3 +58,10 @@ temp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local database backups
+*.dump
+*.sql.gz
+
+# Temporary backup files
+*.backup-*

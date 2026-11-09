@@ -1,0 +1,33 @@
+{
+  "name": "cloudpilot-phase-08-integration",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/phase-08/src/main.js",
+    "start:env": "node --env-file=.env dist/phase-08/src/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prisma:generate": "prisma generate --schema prisma/schema.prisma",
+    "prisma:migrate": "prisma migrate deploy --schema prisma/schema.prisma",
+    "prisma:check": "node scripts/verify-prisma-lineage.mjs",
+    "test:unit": "npm run build && node --test \"dist/phase-08/test/unit/*.test.js\"",
+    "test:integration": "npm run build && node --test --test-concurrency=1 \"dist/phase-08/test/integration/*.test.js\"",
+    "test": "npm run build && node --test \"dist/phase-08/test/unit/*.test.js\" && node --test \"dist/phase-08/test/integration/*.test.js\""
+  },
+  "dependencies": {
+    "@prisma/client": "5.22.0",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.14",
+    "prisma": "5.22.0",
+    "typescript": "5.9.3"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}
