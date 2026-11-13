@@ -62,7 +62,7 @@ export class JwksKeyResolver {
     if (!options.expectedIssuer || typeof options.expectedIssuer !== "string") {
       throw new Error("expectedIssuer is required for JwksKeyResolver.");
     }
-    this.expectedIssuer = options.expectedIssuer.replace(/\/+$/, "");
+    this.expectedIssuer = options.expectedIssuer;
     this.jwksUri = options.jwksUri ?? null;
     this.allowHttp = options.allowHttp ?? false;
     this.allowPrivateIps = options.allowPrivateIps ?? false;
@@ -86,17 +86,26 @@ export class JwksKeyResolver {
    */
   async resolveKey(header: { alg: string; kid?: string }): Promise<ResolvedKey | null> {
     const isCacheExpired = Date.now() - this.lastFetchedAt > this.ttlMs;
+    const usable = (entry: ResolvedKey | undefined): ResolvedKey | null => {
+      if (!entry || entry.alg !== header.alg) return null;
+      if (header.alg === "RS256") return entry.key.asymmetricKeyType === "rsa" ? entry : null;
+      if (header.alg === "ES256") {
+        return entry.key.asymmetricKeyType === "ec" &&
+          entry.key.asymmetricKeyDetails?.namedCurve === "prime256v1" ? entry : null;
+      }
+      return null;
+    };
 
     // Fast path: key is cached and cache is still fresh
     if (header.kid && this.keyCache.has(header.kid) && !isCacheExpired) {
-      return this.keyCache.get(header.kid)!;
+      return usable(this.keyCache.get(header.kid));
     }
 
     // If cache is empty or expired, refresh unconditionally
     if (this.keyCache.size === 0 || isCacheExpired) {
       await this.refreshJwks();
       if (header.kid && this.keyCache.has(header.kid)) {
-        return this.keyCache.get(header.kid)!;
+        return usable(this.keyCache.get(header.kid));
       }
     }
 
@@ -109,18 +118,13 @@ export class JwksKeyResolver {
       }
 
       await this.refreshJwks();
-      if (this.keyCache.has(header.kid)) {
-        return this.keyCache.get(header.kid)!;
-      }
-      return null;
+      return usable(this.keyCache.get(header.kid));
     }
 
     // Token without kid: if exactly one matching key exists in cache, return it
     if (!header.kid && this.keyCache.size === 1) {
       const singleKey = Array.from(this.keyCache.values())[0];
-      if (!singleKey.alg || singleKey.alg === header.alg) {
-        return singleKey;
-      }
+      return usable(singleKey);
     }
 
     return null;
@@ -162,29 +166,11 @@ export class JwksKeyResolver {
       throw new Error("JWKS URI must use HTTPS in production.");
     }
 
-    // 3. Fetch JWKS payload with bounded timeout and size
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    let res: Response;
-    try {
-      res = await this.fetchImpl(urlValidation.sanitizedUrl, {
-        signal: controller.signal,
-        headers: { Accept: "application/json" }
-      });
-    } catch (err) {
-      throw new Error(`Failed to fetch JWKS from ${urlValidation.sanitizedUrl}: ${sanitizeErrorDetails(err)}`);
-    } finally {
-      clearTimeout(timer);
-    }
+    // 3. Fetch and consume JWKS under one timeout and a streaming byte limit.
+    const { response: res, bodyText } = await this.fetchBoundedText(urlValidation.sanitizedUrl, "JWKS");
 
     if (!res.ok) {
       throw new Error(`JWKS endpoint returned HTTP ${res.status} ${res.statusText}`);
-    }
-
-    const bodyText = await res.text();
-    if (bodyText.length > this.maxResponseBytes) {
-      throw new Error(`JWKS response exceeded maximum size limit (${this.maxResponseBytes} bytes).`);
     }
 
     let jwksData: JwksResponse;
@@ -211,8 +197,10 @@ export class JwksKeyResolver {
       // We support RSA (RS256) and EC (ES256 on P-256 curve)
       const isRsa = jwk.kty === "RSA";
       const isEcP256 = jwk.kty === "EC" && (jwk.crv === "P-256" || jwk.crv === "secp256r1");
-
-      if (!isRsa && !isEcP256) {
+      const alg = jwk.alg === undefined
+        ? isRsa ? "RS256" : isEcP256 ? "ES256" : ""
+        : typeof jwk.alg === "string" ? jwk.alg : "";
+      if (!((alg === "RS256" && isRsa) || (alg === "ES256" && isEcP256))) {
         continue;
       }
 
@@ -224,7 +212,7 @@ export class JwksKeyResolver {
 
         const keyEntry: ResolvedKey = {
           key: keyObject,
-          alg: typeof jwk.alg === "string" ? jwk.alg : isRsa ? "RS256" : "ES256",
+          alg,
           kid: typeof jwk.kid === "string" ? jwk.kid : undefined
         };
 
@@ -244,7 +232,7 @@ export class JwksKeyResolver {
   }
 
   private async discoverJwksUri(): Promise<string> {
-    const discoveryUrl = `${this.expectedIssuer}/.well-known/openid-configuration`;
+    const discoveryUrl = `${this.expectedIssuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
 
     const urlValidation = validateAndSanitizeUrl(discoveryUrl, {
       allowPrivateIps: this.allowPrivateIps
@@ -257,28 +245,10 @@ export class JwksKeyResolver {
       throw new Error("OIDC discovery must use HTTPS in production.");
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    let res: Response;
-    try {
-      res = await this.fetchImpl(urlValidation.sanitizedUrl, {
-        signal: controller.signal,
-        headers: { Accept: "application/json" }
-      });
-    } catch (err) {
-      throw new Error(`Failed to fetch OIDC configuration from ${discoveryUrl}: ${sanitizeErrorDetails(err)}`);
-    } finally {
-      clearTimeout(timer);
-    }
+    const { response: res, bodyText } = await this.fetchBoundedText(urlValidation.sanitizedUrl, "OIDC discovery");
 
     if (!res.ok) {
       throw new Error(`OIDC discovery endpoint returned HTTP ${res.status} ${res.statusText}`);
-    }
-
-    const bodyText = await res.text();
-    if (bodyText.length > this.maxResponseBytes) {
-      throw new Error(`OIDC discovery response exceeded maximum size limit (${this.maxResponseBytes} bytes).`);
     }
 
     let config: OidcConfiguration;
@@ -289,8 +259,14 @@ export class JwksKeyResolver {
     }
 
     // Verify discovered issuer matches expected issuer strictly
-    if (config.issuer && config.issuer.replace(/\/+$/, "") !== this.expectedIssuer) {
-      throw new Error(`Discovered issuer '${config.issuer}' does not match expected issuer '${this.expectedIssuer}'.`);
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+      throw new Error("OIDC discovery response must be a JSON object.");
+    }
+    if (typeof config.issuer !== "string" || !config.issuer.trim()) {
+      throw new Error("OIDC discovery response missing a non-empty 'issuer'.");
+    }
+    if (config.issuer !== this.expectedIssuer) {
+      throw new Error("Discovered issuer does not match the configured issuer.");
     }
 
     if (!config.jwks_uri || typeof config.jwks_uri !== "string") {
@@ -298,5 +274,59 @@ export class JwksKeyResolver {
     }
 
     return config.jwks_uri;
+  }
+
+  private async fetchBoundedText(url: string, label: string): Promise<{ response: Response; bodyText: string }> {
+    const controller = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        void reader?.cancel().catch(() => {});
+        reject(new Error(`${label} request timed out.`));
+      }, this.timeoutMs);
+    });
+    const request = (async () => {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(url, {
+          signal: controller.signal,
+          headers: { Accept: "application/json" },
+          redirect: "error"
+        });
+      } catch (err) {
+        throw new Error(`Failed to fetch ${label} from ${url}: ${sanitizeErrorDetails(err)}`);
+      }
+      if (response.status >= 300 && response.status < 400) {
+        void response.body?.cancel().catch(() => {});
+        throw new Error(`${label} endpoint redirects are not allowed.`);
+      }
+      if (!response.body) return { response, bodyText: "" };
+
+      reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > this.maxResponseBytes) {
+          void reader.cancel().catch(() => {});
+          throw new Error(`${label} response exceeded maximum size limit (${this.maxResponseBytes} bytes).`);
+        }
+        chunks.push(value);
+      }
+      const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), totalBytes);
+      return { response, bodyText: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    })();
+
+    try {
+      return await Promise.race([request, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { reader?.releaseLock(); } catch { /* stream may already be cancelled */ }
+    }
   }
 }

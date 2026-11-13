@@ -10,8 +10,12 @@ import { RemediationExecutionPersistenceService } from "../../src/remediation/re
 import { TrustedClaimExecutionContextService } from "../../src/remediation/trusted-claim-execution-context.js";
 import { PrismaRemediationExecutionLifecycle } from "../../src/jobs/remediation-execution-lifecycle.js";
 import { renderExecutionArtifact, sealExecutionArtifact } from "../../src/remediation/execution-artifact.js";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 
-const DATABASE_URL = process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const DATABASE_URL = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_claim_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_claim_test";
 if (!DATABASE_URL) {
   throw new Error("CLOUDPILOT_CLAIM_TEST_DATABASE_URL is required for the remediation claim integration test.");
 }
@@ -33,13 +37,18 @@ const EXPECTED_MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ] as const;
 
 const HASH = "a".repeat(64);
 const BASE_SHA = "0123456789abcdef0123456789abcdef01234567";
 
 function parseApprovedUrl(value: string): URL {
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return new URL(acceptanceDatabase.url);
+  }
   let url: URL;
   try {
     url = new URL(value);
@@ -506,8 +515,8 @@ test("PostgreSQL remediation claim eligibility, constraints, and lease fencing",
     const identity = await prisma.$queryRaw<Array<{
       database: string; username: string; serverPort: number;
     }>>`SELECT current_database() AS database, current_user AS username, inet_server_port() AS "serverPort";`;
-    assert.equal(identity[0]?.database, "cloudpilot_claim_test");
-    assert.equal(identity[0]?.username, "cloudpilot_claim_test");
+    assert.equal(identity[0]?.database, expectedDatabase);
+    assert.equal(identity[0]?.username, expectedUsername);
     assert.equal(Number(identity[0]?.serverPort), 5432);
     await verifyMigrationHistory(prisma);
     await verifyDatabaseProtections(prisma);

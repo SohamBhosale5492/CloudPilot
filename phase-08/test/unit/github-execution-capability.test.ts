@@ -57,8 +57,16 @@ function setup(options: { mutate?: (s: ReturnType<typeof state>) => void; tokenM
   const persisted = state(); options.mutate?.(persisted);
   const lockRow = [{ id: "locked" }];
   const tx = {
-    $queryRaw: async (parts: TemplateStringsArray) => parts.join(" ").includes("FROM remediations")
-      ? [{ ...persisted.remediation }] : lockRow,
+    $queryRaw: async (parts: TemplateStringsArray) => {
+      const sql = parts.join(" ");
+      if (sql.includes("FROM remediations")) return [{ ...persisted.remediation }];
+      if (sql.includes("cloudpilot_lock_active_organization") || sql.includes("cloudpilot_lock_scoped_finding") ||
+          sql.includes("cloudpilot_lock_active_binding_installation")) return [{ locked: true }];
+      if (sql.includes("cloudpilot_lock_active_member") || sql.includes("cloudpilot_lock_active_actor_for_update")) {
+        return [{ role: persisted.approverMembership?.role ?? null }];
+      }
+      return lockRow;
+    },
     organization: { findUnique: async () => ({ status: persisted.organizationStatus }) },
     project: { findFirst: async () => persisted.project }, scan: { findFirst: async () => persisted.scan },
     finding: { findFirst: async () => persisted.finding },

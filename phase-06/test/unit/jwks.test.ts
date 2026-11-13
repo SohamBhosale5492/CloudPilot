@@ -121,6 +121,25 @@ test("JWKS: verifies ES256 token using EC P-256 key from JWKS", async () => {
   assert.equal(res.securityContext?.identity.userId, "usr-jwks-ec");
 });
 
+test("JWKS: rejects a key whose declared algorithm differs from the token algorithm", async () => {
+  const incompatible = { ...getRsaJwk("rsa-marked-es"), alg: "ES256" };
+  const resolver = new JwksKeyResolver({
+    expectedIssuer: TEST_ISSUER,
+    jwksUri: `${TEST_ISSUER}/jwks.json`,
+    allowHttp: true,
+    allowPrivateIps: true,
+    fetchImpl: async () => new Response(JSON.stringify({ keys: [incompatible] }), { status: 200 })
+  });
+  const result = await verifyJwtToken(mintTestJwt({ kid: "rsa-marked-es" }), {
+    expectedIssuer: TEST_ISSUER,
+    expectedAudience: TEST_AUDIENCE,
+    keyResolver: resolver,
+    allowedAlgorithms: ["RS256"]
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error ?? "", /Signing key not found/i);
+});
+
 test("JWKS: rotates key when new token with new kid arrives", async () => {
   // Generate rotated RSA key
   const { privateKey: rotatedPriv, publicKey: rotatedPub } = crypto.generateKeyPairSync("rsa", {
@@ -381,4 +400,103 @@ test("JWKS: handles unavailable provider or malformed metadata gracefully", asyn
   const res = await verifyJwtToken(token, config);
   assert.equal(res.valid, false);
   assert.match(res.error ?? "", /Key resolution error|returned HTTP 500/i);
+});
+
+function stalledResponse(signal?: AbortSignal): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+    }
+  });
+  return new Response(body, { status: 200 });
+}
+
+test("JWKS body read is covered by the request timeout", async () => {
+  const resolver = new JwksKeyResolver({
+    expectedIssuer: TEST_ISSUER,
+    jwksUri: `${TEST_ISSUER}/jwks.json`,
+    allowHttp: true,
+    allowPrivateIps: true,
+    timeoutMs: 15,
+    fetchImpl: async (_url, init) => stalledResponse(init?.signal ?? undefined)
+  });
+  await assert.rejects(resolver.refreshJwks(), /timed out/i);
+});
+
+test("OIDC discovery body read is covered by the request timeout", async () => {
+  const resolver = new JwksKeyResolver({
+    expectedIssuer: TEST_ISSUER,
+    allowHttp: true,
+    allowPrivateIps: true,
+    timeoutMs: 15,
+    fetchImpl: async (_url, init) => stalledResponse(init?.signal ?? undefined)
+  });
+  await assert.rejects(resolver.refreshJwks(), /timed out/i);
+});
+
+test("oversized JWKS and discovery bodies are rejected while streaming", async () => {
+  const oversized = JSON.stringify({ keys: [getRsaJwk()] });
+  const jwks = new JwksKeyResolver({
+    expectedIssuer: TEST_ISSUER,
+    jwksUri: `${TEST_ISSUER}/jwks.json`,
+    allowHttp: true,
+    allowPrivateIps: true,
+    maxResponseBytes: 16,
+    fetchImpl: async () => new Response(oversized, { status: 200 })
+  });
+  await assert.rejects(jwks.refreshJwks(), /exceeded maximum size limit/i);
+
+  const discovery = new JwksKeyResolver({
+    expectedIssuer: TEST_ISSUER,
+    allowHttp: true,
+    allowPrivateIps: true,
+    maxResponseBytes: 16,
+    fetchImpl: async () => new Response(oversized, { status: 200 })
+  });
+  await assert.rejects(discovery.refreshJwks(), /exceeded maximum size limit/i);
+});
+
+test("OIDC discovery requires a non-empty exact issuer before trusting jwks_uri", async () => {
+  for (const metadata of [
+    { jwks_uri: `${TEST_ISSUER}/jwks.json` },
+    { issuer: "", jwks_uri: `${TEST_ISSUER}/jwks.json` },
+    { issuer: "https://other-issuer.test", jwks_uri: `${TEST_ISSUER}/jwks.json` }
+  ]) {
+    let jwksRequested = false;
+    const resolver = new JwksKeyResolver({
+      expectedIssuer: TEST_ISSUER,
+      allowHttp: true,
+      allowPrivateIps: true,
+      fetchImpl: async (url) => {
+        if (String(url).includes("openid-configuration")) return new Response(JSON.stringify(metadata), { status: 200 });
+        jwksRequested = true;
+        return new Response(JSON.stringify({ keys: [] }), { status: 200 });
+      }
+    });
+    await assert.rejects(resolver.refreshJwks(), /issuer/i);
+    assert.equal(jwksRequested, false);
+  }
+});
+
+test("discovery and JWKS redirects are rejected without following external or restricted destinations", async () => {
+  for (const location of ["https://other.example/jwks", "http://169.254.169.254/latest/meta-data"]) {
+    for (const directJwks of [false, true]) {
+      let requests = 0;
+      let redirectMode: RequestRedirect | undefined;
+      const resolver = new JwksKeyResolver({
+        expectedIssuer: TEST_ISSUER,
+        ...(directJwks ? { jwksUri: `${TEST_ISSUER}/jwks.json` } : {}),
+        allowHttp: true,
+        allowPrivateIps: true,
+        fetchImpl: async (_url, init) => {
+          requests++;
+          redirectMode = init?.redirect;
+          return new Response(null, { status: 302, headers: { location } });
+        }
+      });
+      await assert.rejects(resolver.refreshJwks(), /redirect/i);
+      assert.equal(redirectMode, "error");
+      assert.equal(requests, 1, "redirect destination must never be requested");
+    }
+  }
 });

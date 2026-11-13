@@ -5,9 +5,12 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { ProjectGitHubBindingError, ProjectGitHubBindingService } from "../../src/organizations/project-github-binding-service.js";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 
-const DATABASE_NAME = "cloudpilot_phase08_test";
-const DATABASE_PORT = "56432";
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const DATABASE_NAME = acceptanceDatabase?.database ?? "cloudpilot_phase08_test";
+const DATABASE_USER = acceptanceDatabase?.username ?? "cloudpilot_phase08_test";
+const DATABASE_PORT = acceptanceDatabase?.port ?? "56432";
 const CONTAINER_POSTGRES_PORT = 5432;
 const APPROVED_HOSTS = new Set(["127.0.0.1", "localhost"]);
 const MIGRATIONS = [
@@ -27,10 +30,15 @@ const MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ] as const;
 
 function requireDedicatedDatabaseUrl(value: string | undefined): string {
+  if (acceptanceDatabase) {
+    if (value !== undefined && value !== acceptanceDatabase.url) throw new Error("Refusing conflicting database URL configuration.");
+    return acceptanceDatabase.url;
+  }
   if (!value) throw new Error("CLOUDPILOT_PHASE08_TEST_DATABASE_URL is required; refusing database access.");
   let url: URL;
   try {
@@ -52,7 +60,7 @@ function requireDedicatedDatabaseUrl(value: string | undefined): string {
 }
 
 // Validate at module load, before constructing a PrismaClient or issuing any query.
-const testDatabaseUrl = requireDedicatedDatabaseUrl(process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL);
+const testDatabaseUrl = requireDedicatedDatabaseUrl(acceptanceDatabase ? undefined : process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL);
 
 type OrganizationFixture = {
   tenantId: string;
@@ -112,7 +120,7 @@ async function assertDatabaseIdentity(prisma: PrismaClient): Promise<void> {
            inet_server_port() AS server_port
   `;
   assert.equal(identity[0]?.database, DATABASE_NAME, "refuse access outside the dedicated database");
-  assert.equal(identity[0]?.user, "cloudpilot_phase08_test", "refuse access with an unexpected database user");
+  assert.equal(identity[0]?.user, DATABASE_USER, "refuse access with an unexpected database user");
   assert.ok(isExpectedDatabaseServerAddress(identity[0]?.server_address ?? null), "refuse an unexpected PostgreSQL server address");
   assert.equal(identity[0]?.server_port, CONTAINER_POSTGRES_PORT, "the dedicated container must expose PostgreSQL on its internal port");
 }

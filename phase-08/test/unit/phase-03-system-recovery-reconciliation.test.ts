@@ -295,7 +295,8 @@ test("A8: requireRecoveryReview transitions and audits when system recovery leas
     $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
       $queryRaw: async (tpl: TemplateStringsArray) => {
         const sql = tpl.join(" ");
-        if (sql.includes("FROM remediation_executions e") && sql.includes("FOR UPDATE OF e, o, m, u")) {
+        if (sql.includes("cloudpilot_lock_active_actor_for_update")) return [{ role: "admin" }];
+        if (sql.includes("FROM remediation_executions e") && sql.includes("FOR UPDATE OF e")) {
           return [{
             id: candidate.executionId,
             tenantId: candidate.tenantId,

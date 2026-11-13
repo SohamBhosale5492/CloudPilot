@@ -4,6 +4,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { AuthenticatedIdentity } from "../../../phase-06/src/auth/jwt-verifier.js";
 import type { AuthenticatedRouteContext } from "../../../phase-06/src/api/server.js";
 import type { ArchitectureDiscoveryResult } from "../../../phase-01/demo-service/src/architecture-discovery.js";
+import { analyzeNodeExpressSource, type SourceObservabilityAnalysis } from "../../../phase-01/demo-service/src/source-observability-analysis.js";
 import { ArchitectureApiRoutes, LocalManifestArchitectureDiscovery, PrismaArchitectureProjectStore, type ArchitectureDiscoveryService, type ArchitectureProjectStore } from "../../src/api/architecture-api.js";
 
 function identity(role: "admin" | "operator" | "viewer" = "admin", tenantId = "tenant-a"): AuthenticatedIdentity {
@@ -37,10 +38,12 @@ class FakeProjects implements ArchitectureProjectStore {
   saves: unknown[] = [];
   merges: unknown[] = [];
   targetSaves: unknown[] = [];
+  sourceSaves: unknown[] = [];
   async exists(tenantId: string) { return tenantId === "tenant-a" && this.existsResult; }
   async saveExpectedModel(...args: Parameters<ArchitectureProjectStore["saveExpectedModel"]>) { this.saves.push(args); return true; }
   async mergeExpectedModel(...args: Parameters<ArchitectureProjectStore["mergeExpectedModel"]>) { this.merges.push(args); return this.mergeResult; }
   async saveTargetConfig(...args: Parameters<ArchitectureProjectStore["saveTargetConfig"]>) { this.targetSaves.push(args); return true; }
+  async saveSourceAnalysis(...args: Parameters<ArchitectureProjectStore["saveSourceAnalysis"]>) { this.sourceSaves.push(args); return true; }
 }
 
 test("discovery is authenticated, tenant scoped, and preserves partial diagnostics without saving a model", async () => {
@@ -140,7 +143,7 @@ test("telemetry target route validates supported config, scopes by tenant, and s
   assert.equal(projects.targetSaves.length, 1);
   assert.equal((projects.targetSaves[0] as unknown[])[0], "tenant-a");
 
-  const unsupported = request("PUT", "/api/v1/projects/p1/target-config", identity("admin"), { targetConfig: { traceBackendUrl: "http://localhost:16686" } });
+  const unsupported = request("PUT", "/api/v1/projects/p1/target-config", identity("admin"), { targetConfig: { unknownBackendUrl: "http://localhost:16686" } });
   await routes.handle(unsupported.context);
   assert.equal(unsupported.response.status, 400);
   assert.equal(projects.targetSaves.length, 1);
@@ -159,4 +162,59 @@ test("local manifest discovery uses the existing Compose engine and rejects unsa
   assert.equal(traversal.status, "invalid");
   const unsupported = await discovery.discover([{ path: "terraform.yaml", content: "resource: {}" }]);
   assert.equal(unsupported.status, "unsupported");
+});
+
+test("source analysis is tenant-scoped, read-only in preview, and persists only on explicit apply", async () => {
+  const files = [
+    { path: "backend/app.js", content: 'const express = require("express"); app.use(observabilityMiddleware); app.get("/health", handler);' },
+    { path: "backend/telemetry.js", content: 'const serviceName = process.env.OTEL_SERVICE_NAME || "alumni-api"; const tracer = trace.getTracer("alumni-api"); tracer.startSpan("request");' }
+  ];
+  const projects = new FakeProjects();
+  const routes = new ArchitectureApiRoutes(projects);
+  const preview = request("POST", "/api/v1/projects/p1/source-observability-analysis", identity(), { files });
+  await routes.handle(preview.context);
+  assert.equal(preview.response.status, 200);
+  const analysis = preview.response.body as SourceObservabilityAnalysis;
+  assert.equal(analysis.serviceName, "alumni-api");
+  assert.ok(analysis.expectedModel.requirements.some((item) => item.signal === "health"));
+  assert.ok(analysis.expectedModel.requirements.some((item) => item.signal === "trace"));
+  assert.equal(projects.sourceSaves.length, 0);
+
+  const apply = request("POST", "/api/v1/projects/p1/source-observability-analysis/apply", identity(), { files, expectedCurrentModel: null });
+  await routes.handle(apply.context);
+  assert.equal(apply.response.status, 200);
+  assert.equal((apply.response.body as { saved: boolean }).saved, true);
+  assert.equal(projects.sourceSaves.length, 1);
+  const savedCall = projects.sourceSaves[0] as unknown[];
+  assert.equal(savedCall[0], "tenant-a");
+  assert.equal(savedCall[2], "user-1");
+
+  const foreign = request("POST", "/api/v1/projects/p1/source-observability-analysis", identity("admin", "tenant-b"), { files });
+  await routes.handle(foreign.context);
+  assert.equal(foreign.response.status, 404);
+  const viewer = request("POST", "/api/v1/projects/p1/source-observability-analysis", identity("viewer"), { files });
+  await routes.handle(viewer.context);
+  assert.equal(viewer.response.status, 403);
+  const unsafe = request("POST", "/api/v1/projects/p1/source-observability-analysis", identity(), { files: [{ path: "../outside.js", content: "x" }] });
+  await routes.handle(unsafe.context);
+  assert.equal(unsafe.response.status, 400);
+});
+
+test("source analysis apply commits model, evidence metadata, and audit in one tenant-scoped transaction", async () => {
+  const rawCalls: Array<{ sql: string; values: unknown[] }> = [];
+  const audits: unknown[] = [];
+  const prisma = {
+    $transaction: async (operation: (tx: unknown) => Promise<unknown>) => operation(prisma),
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => { rawCalls.push({ sql: strings.join("?"), values }); return 1; },
+    auditEvent: { create: async (input: unknown) => { audits.push(input); } }
+  } as unknown as PrismaClient;
+  const store = new PrismaArchitectureProjectStore(prisma);
+  const analysis = analyzeNodeExpressSource([{ path: "app.js", content: 'const express = require("express"); app.get("/health", handler);' }]);
+  const model = analysis.expectedModel;
+  assert.equal(await store.saveSourceAnalysis("tenant-a", "p1", "user-1", null, model, analysis), true);
+  assert.match(rawCalls[0]!.sql, /expected_model IS NOT DISTINCT FROM \?::jsonb/);
+  assert.match(rawCalls[0]!.sql, /target_config = COALESCE\(target_config, '\{\}'::jsonb\) \|\|/);
+  assert.deepEqual(rawCalls[0]!.values.slice(2, 4), ["p1", "tenant-a"]);
+  assert.equal(audits.length, 1);
+  assert.equal((audits[0] as { data: { action: string } }).data.action, "PROJECT_SOURCE_OBSERVABILITY_ANALYZED");
 });

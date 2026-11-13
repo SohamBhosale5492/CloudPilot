@@ -4,6 +4,7 @@ import { mutationRequestHash, type MutationBoundaryScope } from "../github/inter
 import { hasOrganizationPermission } from "../organizations/permissions.js";
 import { REMEDIATION_RETRY_DELAYS_MS, type ExpiredRemediationClaim, type RemediationLease } from "../jobs/remediation-repo.js";
 import { isTrustedClaimExecutionContext, type TrustedClaimExecutionContext } from "./trusted-claim-execution-context.js";
+import { lockActiveActorForUpdate, lockActiveBindingInstallation, lockActiveMember, lockActiveOrganization } from "./postgres-lock-helpers.js";
 import { isAuthorizedArtifactGitHubCapability, type AuthorizedArtifactGitHubCapability } from "../github/github-execution-capability.js";
 import { isTrustedGitHubMutationRejectionEvidence, type GitHubMutationRejectionEvidence } from "../github/artifact-only-github-client.js";
 import { isVerifiedArtifactOnlyGitHubWriteResult, isVerifiedArtifactWriterMutationReceipt,
@@ -277,7 +278,9 @@ export class RemediationExecutionPersistenceService {
     }
     const tokenHash = recoveryLease ? hash(recoveryLease.leaseToken) : null;
     return this.prisma.$transaction(async (tx) => {
-      const rows = await tx.$queryRaw<Array<ExecutionRow & { role: string; userStatus: string; orgStatus: string }>>`
+      const role = await lockActiveActorForUpdate(tx, candidate.organizationId, actorIdentityUserId);
+      if (!role || !hasOrganizationPermission(role, "remediation:approve")) return false;
+      const rows = await tx.$queryRaw<ExecutionRow[]>`
         SELECT e.id, e.tenant_id AS "tenantId", e.organization_id AS "organizationId", e.project_id AS "projectId",
           e.remediation_id AS "remediationId", e.repository_binding_id AS "repositoryBindingId",
           e.installation_record_id AS "installationRecordId", e.github_repository_id AS "githubRepositoryId",
@@ -285,23 +288,19 @@ export class RemediationExecutionPersistenceService {
           e.status, e.stage, e.attempt_number AS "attemptNumber", e.version, e.lease_token_hash AS "leaseTokenHash",
           e.lease_expires_at AS "leaseExpiresAt", e.commit_sha AS "commitSha", e.branch_name AS "branchName",
           e.pull_request_number AS "pullRequestNumber", e.pull_request_url AS "pullRequestUrl",
-          e.reconciliation_status AS "reconciliationStatus", m.role, u.status AS "userStatus", o.status AS "orgStatus"
+          e.reconciliation_status AS "reconciliationStatus"
         FROM remediation_executions e
-        JOIN organizations o ON o.id = e.organization_id
-        JOIN organization_members m ON m.organization_id = e.organization_id
-          AND m.user_id = ${actorIdentityUserId}::uuid AND m.status = 'active'
-        JOIN identity_users u ON u.id = m.user_id AND u.status = 'active'
         WHERE e.id = ${candidate.executionId}::uuid AND e.tenant_id = ${candidate.tenantId}
           AND e.organization_id = ${candidate.organizationId}::uuid AND e.project_id = ${candidate.projectId}
           AND e.remediation_id = ${candidate.remediationId} AND e.repository_binding_id = ${candidate.repositoryBindingId}::uuid
           AND e.github_repository_id = ${candidate.githubRepositoryId}::bigint AND e.artifact_hash = ${candidate.artifactHash}
           AND e.base_ref = ${candidate.baseRef} AND e.base_commit_sha = ${candidate.baseCommitSha}
-          AND o.status = 'active' AND e.status NOT IN ('completed', 'reconciliation_resolved')
+          AND e.status NOT IN ('completed', 'reconciliation_resolved')
           ${recoveryLease ? Prisma.sql`AND e.recovery_lease_hash = ${tokenHash} AND e.recovery_lease_until > clock_timestamp()` : Prisma.empty}
-        FOR UPDATE OF e, o, m, u
+        FOR UPDATE OF e
       `;
       const row = rows[0];
-      if (!row || !hasOrganizationPermission(row.role, "remediation:approve")) return false;
+      if (!row) return false;
       if (row.reconciliationStatus === "in_progress" || row.status === "reconciliation_in_progress") return false;
       const intents = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id FROM remediation_execution_events WHERE execution_id = ${row.id}::uuid
@@ -530,7 +529,16 @@ export class RemediationExecutionPersistenceService {
     const token = randomUUID();
     const tokenHash = hash(token);
     return this.prisma.$transaction(async (tx) => {
-      const rows = await tx.$queryRaw<Array<ExecutionRow & { actorRole: string; actorStatus: string; orgStatus: string }>>`
+      const scope = await tx.$queryRaw<Array<{ organizationId: string }>>`
+        SELECT organization_id AS "organizationId" FROM remediation_executions
+        WHERE id = ${input.executionId}::uuid AND status = 'manual_review_required'
+          AND (reconciliation_status = 'required' OR
+            (reconciliation_status = 'in_progress' AND reconciliation_lease_until <= clock_timestamp()))
+      `;
+      if (scope.length !== 1) return null;
+      const actorRole = await lockActiveActorForUpdate(tx, scope[0]!.organizationId, input.actorIdentityUserId);
+      if (!actorRole || !hasOrganizationPermission(actorRole, "remediation:approve")) return null;
+      const rows = await tx.$queryRaw<ExecutionRow[]>`
         SELECT e.id, e.tenant_id AS "tenantId", e.organization_id AS "organizationId", e.project_id AS "projectId",
           e.remediation_id AS "remediationId", e.repository_binding_id AS "repositoryBindingId",
           e.installation_record_id AS "installationRecordId", e.github_repository_id AS "githubRepositoryId",
@@ -538,19 +546,15 @@ export class RemediationExecutionPersistenceService {
           e.status, e.stage, e.attempt_number AS "attemptNumber", e.version, e.lease_token_hash AS "leaseTokenHash",
           e.lease_expires_at AS "leaseExpiresAt", e.commit_sha AS "commitSha", e.branch_name AS "branchName",
           e.pull_request_number AS "pullRequestNumber", e.pull_request_url AS "pullRequestUrl",
-          e.reconciliation_status AS "reconciliationStatus", m.role AS "actorRole", u.status AS "actorStatus", o.status AS "orgStatus"
+          e.reconciliation_status AS "reconciliationStatus"
         FROM remediation_executions e
-        JOIN organizations o ON o.id = e.organization_id AND o.status = 'active'
-        JOIN organization_members m ON m.organization_id = e.organization_id AND m.user_id = ${input.actorIdentityUserId}::uuid AND m.status = 'active'
-        JOIN identity_users u ON u.id = m.user_id AND u.status = 'active'
         WHERE e.id = ${input.executionId}::uuid AND e.status = 'manual_review_required'
           AND (e.reconciliation_status = 'required' OR
             (e.reconciliation_status = 'in_progress' AND e.reconciliation_lease_until <= clock_timestamp()))
-        FOR UPDATE OF e, m, u, o
+        FOR UPDATE OF e
       `;
       const execution = rows[0];
-      if (!execution || execution.actorStatus !== "active" || execution.orgStatus !== "active" ||
-          !hasOrganizationPermission(execution.actorRole, "remediation:approve")) return null;
+      if (!execution) return null;
       const updated = await tx.$queryRaw<Array<{ expiresAt: Date }>>`
         UPDATE remediation_executions SET status = 'reconciliation_in_progress', reconciliation_status = 'in_progress',
           reconciliation_started_at = COALESCE(reconciliation_started_at, clock_timestamp()),
@@ -665,6 +669,8 @@ export class RemediationExecutionPersistenceService {
     if (input.outcome === "completed" && !input.completionEvidence) return false;
     if (input.outcome !== "completed" && input.completionEvidence) return false;
     return this.prisma.$transaction(async (tx) => {
+      const actorRole = await lockActiveActorForUpdate(tx, input.lease.organizationId, input.lease.actorIdentityUserId);
+      if (actorRole !== "owner" && actorRole !== "admin") return false;
       const execution = await tx.$queryRaw<ExecutionRow[]>`
         SELECT e.id, e.tenant_id AS "tenantId", e.organization_id AS "organizationId", e.project_id AS "projectId",
           e.remediation_id AS "remediationId", e.repository_binding_id AS "repositoryBindingId",
@@ -675,16 +681,12 @@ export class RemediationExecutionPersistenceService {
           e.pull_request_number AS "pullRequestNumber", e.pull_request_url AS "pullRequestUrl",
           e.reconciliation_status AS "reconciliationStatus"
         FROM remediation_executions e
-        JOIN organization_members m ON m.organization_id = e.organization_id AND m.user_id = ${input.lease.actorIdentityUserId}::uuid AND m.status = 'active'
-        JOIN identity_users u ON u.id = m.user_id AND u.status = 'active'
-        JOIN organizations o ON o.id = e.organization_id AND o.status = 'active'
         WHERE e.id = ${input.lease.executionId}::uuid AND e.organization_id = ${input.lease.organizationId}::uuid
           AND e.status = 'reconciliation_in_progress' AND e.reconciliation_status = 'in_progress'
           AND e.reconciliation_actor_id = ${input.lease.actorIdentityUserId}::uuid
           AND e.reconciliation_lease_hash = ${hash(input.lease.leaseToken)}
           AND e.reconciliation_lease_until > clock_timestamp()
-          AND m.role IN ('owner', 'admin')
-        FOR UPDATE OF e, m, u, o
+        FOR UPDATE OF e
       `;
       const row = execution[0];
       if (!row) return false;
@@ -1288,24 +1290,19 @@ async function lockAuthorizedRemediation(tx: Tx, lease: RemediationLease, contex
       row.baseRef !== context.baseRef || row.baseCommitSha !== context.baseCommitSha) return false;
 
   const authorizationLocks = await Promise.all([
-    tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM organizations WHERE id = ${context.organizationId}::uuid AND status = 'active' FOR SHARE`,
+    lockActiveOrganization(tx, context.organizationId),
     tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM projects WHERE id = ${context.projectId} AND tenant_id = ${context.tenantId} AND organization_id = ${context.organizationId}::uuid FOR SHARE`,
     tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM project_organization_adoptions WHERE tenant_id = ${context.tenantId}
       AND organization_id = ${context.organizationId}::uuid AND project_id = ${context.projectId} AND status = 'approved' FOR SHARE`,
-    tx.$queryRaw<Array<{ id: string }>>`SELECT b.id FROM project_github_repositories b
-      JOIN organization_github_installations i ON i.id = b.installation_record_id AND i.organization_id = b.organization_id
-      WHERE b.id = ${context.repositoryBindingId}::uuid AND b.tenant_id = ${context.tenantId}
-        AND b.organization_id = ${context.organizationId}::uuid AND b.project_id = ${context.projectId}
-        AND b.installation_record_id = ${context.installationRecordId}::uuid
-        AND b.github_repository_id = ${context.githubRepositoryId}::bigint AND b.status = 'active' AND i.status = 'active'
-      FOR SHARE OF b, i`,
+    lockActiveBindingInstallation(tx, { tenantId: context.tenantId, organizationId: context.organizationId,
+      projectId: context.projectId, bindingId: context.repositoryBindingId,
+      installationId: context.installationRecordId, githubRepositoryId: context.githubRepositoryId }),
     tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM identity_users WHERE id = ${row.requestedByIdentityUserId}::uuid AND status = 'active' FOR SHARE`,
-    tx.$queryRaw<Array<{ id: string }>>`SELECT u.id FROM identity_users u
-      JOIN organization_members m ON m.user_id = u.id AND m.organization_id = ${context.organizationId}::uuid
-      WHERE u.id = ${row.approvedByIdentityUserId}::uuid AND u.status = 'active' AND m.status = 'active'
-        AND m.role IN ('owner', 'admin') FOR SHARE OF u, m`
+    lockActiveMember(tx, context.organizationId, row.approvedByIdentityUserId)
   ]);
-  return authorizationLocks.every((locks) => locks.length === 1);
+  const approverRole = authorizationLocks[5];
+  return authorizationLocks.slice(0, 5).every((result) => Array.isArray(result) ? result.length === 1 : result === true) &&
+    (approverRole === "owner" || approverRole === "admin");
 }
 
 async function lockExecution(tx: Tx, lease: RemediationLease, executionId: string): Promise<ExecutionRow> {
@@ -1343,7 +1340,11 @@ async function lockExecution(tx: Tx, lease: RemediationLease, executionId: strin
 }
 
 async function lockReconciliationExecution(tx: Tx, lease: ReconciliationLease): Promise<ExecutionRow> {
-  const rows = await tx.$queryRaw<Array<ExecutionRow & { actorRole: string }>>`
+  const actorRole = await lockActiveActorForUpdate(tx, lease.organizationId, lease.actorIdentityUserId);
+  if (actorRole !== "owner" && actorRole !== "admin") {
+    throw new RemediationExecutionPersistenceError("reconciliation_not_authorized");
+  }
+  const rows = await tx.$queryRaw<ExecutionRow[]>`
     SELECT e.id, e.tenant_id AS "tenantId", e.organization_id AS "organizationId", e.project_id AS "projectId",
       e.remediation_id AS "remediationId", e.repository_binding_id AS "repositoryBindingId",
       e.installation_record_id AS "installationRecordId", e.github_repository_id AS "githubRepositoryId",
@@ -1351,22 +1352,17 @@ async function lockReconciliationExecution(tx: Tx, lease: ReconciliationLease): 
       e.status, e.stage, e.attempt_number AS "attemptNumber", e.version, e.lease_token_hash AS "leaseTokenHash",
       e.lease_expires_at AS "leaseExpiresAt", e.commit_sha AS "commitSha", e.branch_name AS "branchName",
       e.pull_request_number AS "pullRequestNumber", e.pull_request_url AS "pullRequestUrl",
-      e.reconciliation_status AS "reconciliationStatus", m.role AS "actorRole"
+      e.reconciliation_status AS "reconciliationStatus"
     FROM remediation_executions e
-    JOIN organizations o ON o.id = e.organization_id AND o.status = 'active'
-    JOIN organization_members m ON m.organization_id = e.organization_id
-      AND m.user_id = ${lease.actorIdentityUserId}::uuid AND m.status = 'active'
-    JOIN identity_users u ON u.id = m.user_id AND u.status = 'active'
     WHERE e.id = ${lease.executionId}::uuid AND e.organization_id = ${lease.organizationId}::uuid
       AND e.status = 'reconciliation_in_progress' AND e.reconciliation_status = 'in_progress'
       AND e.reconciliation_actor_id = ${lease.actorIdentityUserId}::uuid
       AND e.reconciliation_lease_hash = ${hash(lease.leaseToken)}
-      AND e.reconciliation_lease_until > clock_timestamp() AND m.role IN ('owner', 'admin')
-    FOR UPDATE OF e, o, m, u
+      AND e.reconciliation_lease_until > clock_timestamp()
+    FOR UPDATE OF e
   `;
   if (rows.length !== 1) throw new RemediationExecutionPersistenceError("reconciliation_not_authorized");
-  const { actorRole: _actorRole, ...row } = rows[0]!;
-  return row;
+  return rows[0]!;
 }
 
 function capabilityMatchesExecution(capability: AuthorizedArtifactGitHubCapability, row: ExecutionRow): boolean {

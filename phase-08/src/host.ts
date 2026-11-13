@@ -1,14 +1,11 @@
 import { PrismaClient } from "@prisma/client";
 import { isIP } from "node:net";
+import { randomUUID } from "node:crypto";
 import { assertExecutionArtifactImmutabilityTrigger, type ExecutionArtifactTriggerCatalogRow } from "./db/execution-artifact-integrity.js";
 import { CloudPilotApiServer } from "../../phase-06/src/api/server.js";
 import type { AuthenticatedRouteExtension } from "../../phase-06/src/api/server.js";
 import { JwtVerifierConfig } from "../../phase-06/src/auth/jwt-verifier.js";
 import { BoundedScanRunner } from "../../phase-06/src/jobs/scan-runner.js";
-import { GitHubConnector } from "../../phase-07/src/github/github-connector.js";
-import { GitHubRemediationExecutor } from "../../phase-07/src/remediation/github-executor.js";
-import { RemediationApiRoutes } from "./api/remediation-api.js";
-import { RemediationApiRepository } from "./api/remediation-api-repo.js";
 import { RemediationProposalApiRoutes } from "./api/remediation-proposal-api.js";
 import { RemediationReconciliationApiRoutes } from "./api/remediation-reconciliation-api.js";
 import { PrismaRemediationProposalRepository } from "./api/remediation-proposal-repo.js";
@@ -20,7 +17,7 @@ import { PrismaOrganizationService } from "./organizations/organization-service.
 import { PrismaOrganizationAuthorizationService } from "./organizations/authorization-service.js";
 import { PrismaProjectAdoptionService } from "./organizations/project-adoption-service.js";
 import { RemediationJobRepository } from "./jobs/remediation-repo.js";
-import { RemediationRunner } from "./jobs/remediation-runner.js";
+import { PrismaRemediationExecutionLifecycle } from "./jobs/remediation-execution-lifecycle.js";
 import { GitHubRepositoryApiRoutes, PrismaGitHubRepositoryStore } from "./api/github-repository-api.js";
 import { GitHubConnectIntentApiRoutes } from "./api/github-connect-intent-api.js";
 import { GitHubInstallationCallbackApiRoutes } from "./api/github-installation-callback-api.js";
@@ -53,7 +50,7 @@ import { GitHubInstallationRepositoriesApi } from "./api/github-installation-rep
 import { ProjectGitHubBindingApi } from "./api/project-github-binding-api.js";
 import { ProjectGitHubBindingService } from "./organizations/project-github-binding-service.js";
 import {
-  NoGitHubRepositoryBindingResolver,
+  PrismaGitHubRepositoryBindingResolver,
   PrismaTrustedOrganizationGitHubAuthorizationService,
   type TrustedOrganizationGitHubAuthorizationService
 } from "./github/organization-authorization-contract.js";
@@ -133,7 +130,13 @@ export class CloudPilotApplicationHost {
     try {
       await this.database.connect();
       await this.database.verify();
-      return await this.api.start(this.port, this.bindAddress);
+      if (this.remediationWorkerEnabled) {
+        if (!this.artifactOnlyRemediationWorker) throw new Error("Approved-artifact worker composition is unavailable.");
+        await this.githubAppCredentialProvider.getAppAuthenticationCredentials();
+      }
+      const boundPort = await this.api.start(this.port, this.bindAddress);
+      if (this.remediationWorkerEnabled) this.artifactOnlyRemediationWorker!.start(`cloudpilot:${randomUUID()}`);
+      return boundPort;
     } catch (cause) {
       try {
         await this.cleanup();
@@ -148,7 +151,8 @@ export class CloudPilotApplicationHost {
     if (this.cleanupTask) return this.cleanupTask;
     this.cleanupTask = (async () => {
       let firstError: unknown;
-      try { await this.api.stop(); } catch (error) { firstError = error; }
+      try { await this.artifactOnlyRemediationWorker?.stop?.(); } catch (error) { firstError = error; }
+      try { await this.api.stop(); } catch (error) { firstError ??= error; }
       try { await this.database.disconnect(); } catch (error) { firstError ??= error; }
       if (firstError) throw firstError;
     })();
@@ -243,9 +247,6 @@ export function createCloudPilotHostFromEnvironment(
     throw new Error("CLOUDPILOT_ENABLE_REMEDIATION_WORKER must be 'true' or 'false'.");
   }
   const workerEnabled = rawWorkerFlag === "true";
-  if (workerEnabled) {
-    throw new Error("CLOUDPILOT_ENABLE_REMEDIATION_WORKER cannot be enabled until approved-artifact execution is integrated.");
-  }
   const allowIdentityProvisioning = optionalBoolean(
     env.CLOUDPILOT_IDENTITY_PROVISIONING_ENABLED,
     "CLOUDPILOT_IDENTITY_PROVISIONING_ENABLED",
@@ -261,17 +262,6 @@ export function createCloudPilotHostFromEnvironment(
   const connectIntentLifetimeSeconds = githubConnectIntentLifetimeSeconds(env.CLOUDPILOT_GITHUB_CONNECT_INTENT_TTL_SECONDS);
   const port = requiredPort(env.PORT);
   const bindAddress = requiredBindAddress(env.HOST);
-
-  if (workerEnabled && (!env.GITHUB_TOKEN || !env.GITHUB_TOKEN.trim())) {
-    throw new Error("GITHUB_TOKEN is required when the remediation worker is enabled.");
-  }
-
-  const connector = workerEnabled
-    ? new GitHubConnector({
-        token: env.GITHUB_TOKEN!,
-        ...(env.GITHUB_API_BASE_URL ? { apiBaseUrl: env.GITHUB_API_BASE_URL } : {})
-      })
-    : null;
 
   const prisma = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
   const routeExtensions: AuthenticatedRouteExtension[] = [];
@@ -328,9 +318,8 @@ export function createCloudPilotHostFromEnvironment(
   routeExtensions.push(new ArchitectureApiRoutes(new PrismaArchitectureProjectStore(prisma)));
   // Repository metadata routes are available independently of worker execution.
   routeExtensions.push(new GitHubRepositoryApiRoutes(new PrismaGitHubRepositoryStore(prisma)));
-  // Human proposal review is available with the worker disabled. This route
-  // has no scheduler or GitHub dependency and approved records remain unclaimable
-  // by the legacy worker until Stage B adds the authorized execution path.
+  // Human proposal review remains available with execution disabled; only the
+  // explicit host worker flag activates the approved-artifact execution path.
   const trustedSnapshotReader = new GitHubTrustedRepositorySnapshotReader(
     prisma,
     new ContentsReadInstallationTokenService(githubAppCredentialProvider)
@@ -365,16 +354,24 @@ export function createCloudPilotHostFromEnvironment(
     artifactWriter,
     draftPrPublisher
   );
+  const executionLifecycle = new PrismaRemediationExecutionLifecycle(
+    trustedClaimExecutionContextService, remediationExecutionPersistenceService
+  );
+  const remediationJobRepository = new RemediationJobRepository(prisma, executionLifecycle);
   const artifactRemediationWorker = new ArtifactOnlyRemediationWorker(
-    new RemediationJobRepository(prisma),
+    remediationJobRepository,
     artifactExecutionOrchestrator,
-    { autoStart: false }
+    {
+      autoStart: false,
+      onError: (stage) => process.stderr.write(`CloudPilot artifact worker ${stage} operation failed; durable lease fencing remains active.\n`)
+    }
   );
 
   routeExtensions.push(new RemediationProposalApiRoutes(
     identityResolver,
     proposalRepository,
-    { expectedIssuer: jwtConfig.expectedIssuer }
+    { expectedIssuer: jwtConfig.expectedIssuer },
+    artifactPreparationService
   ));
   routeExtensions.push(new RemediationReconciliationApiRoutes(
     identityResolver,
@@ -382,12 +379,6 @@ export function createCloudPilotHostFromEnvironment(
     prisma,
     { expectedIssuer: jwtConfig.expectedIssuer }
   ));
-  if (connector) {
-    const executor = new GitHubRemediationExecutor(connector, { draft: true });
-    const worker = new RemediationRunner(new RemediationJobRepository(prisma), executor);
-    routeExtensions.push(new RemediationApiRoutes(new RemediationApiRepository(prisma), worker));
-  }
-
   const api = new CloudPilotApiServer({
     prisma,
     jwtConfig,
@@ -438,6 +429,30 @@ export function createCloudPilotHostFromEnvironment(
         WHERE trg.tgname = 'trg_remediations_execution_artifact_immutable'
       `;
       assertExecutionArtifactImmutabilityTrigger(artifactTrigger);
+      const lockHelpers = await prisma.$queryRaw<Array<{ function_name: string; security_definer: boolean;
+        configuration: string[] | null; owner_name: string; executable: boolean }>>`
+        SELECT proc.proname AS function_name, proc.prosecdef AS security_definer,
+          proc.proconfig AS configuration, owner.rolname AS owner_name,
+          has_function_privilege(current_user, proc.oid, 'EXECUTE') AS executable
+        FROM pg_catalog.pg_proc AS proc
+        JOIN pg_catalog.pg_namespace AS ns ON ns.oid = proc.pronamespace
+        JOIN pg_catalog.pg_roles AS owner ON owner.oid = proc.proowner
+        WHERE ns.nspname = 'public' AND proc.proname = ANY(ARRAY[
+          'cloudpilot_lock_active_organization', 'cloudpilot_lock_active_member',
+          'cloudpilot_lock_active_actor_for_update', 'cloudpilot_lock_scoped_finding',
+          'cloudpilot_lock_active_binding_installation'
+        ])
+      `;
+      const requiredLockHelpers = [
+        "cloudpilot_lock_active_organization", "cloudpilot_lock_active_member",
+        "cloudpilot_lock_active_actor_for_update", "cloudpilot_lock_scoped_finding",
+        "cloudpilot_lock_active_binding_installation"
+      ];
+      if (lockHelpers.length !== requiredLockHelpers.length || requiredLockHelpers.some((name) => {
+        const helper = lockHelpers.find((candidate) => candidate.function_name === name);
+        return !helper || !helper.security_definer || helper.owner_name !== "cloudpilot_migrator" || !helper.executable ||
+          !helper.configuration?.includes("search_path=pg_catalog");
+      })) throw new Error("Required PostgreSQL runtime lock helpers are missing or incorrectly configured.");
       if (workerEnabled) {
         const leaseColumns = await prisma.$queryRaw<Array<{ column_name: string }>>`
           SELECT column_name FROM information_schema.columns
@@ -451,7 +466,7 @@ export function createCloudPilotHostFromEnvironment(
   };
   return new CloudPilotApplicationHost(
     database, api, port, workerEnabled, bindAddress, githubAppCredentialProvider, githubAppTokenService,
-    new PrismaTrustedOrganizationGitHubAuthorizationService(prisma, new NoGitHubRepositoryBindingResolver()),
+    new PrismaTrustedOrganizationGitHubAuthorizationService(prisma, new PrismaGitHubRepositoryBindingResolver()),
     artifactPreparationService,
     executionAuthorizationService,
     githubExecutionCapabilityService,

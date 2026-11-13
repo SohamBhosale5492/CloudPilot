@@ -8,7 +8,9 @@ export type Permission =
   | "scan:read"
   | "scan:create"
   | "finding:read"
-  | "audit:read";
+  | "audit:read"
+  | "remediation:create"
+  | "remediation:read";
 
 const ROLE_PERMISSIONS: Record<UserRole, ReadonlySet<Permission>> = {
   admin: new Set<Permission>([
@@ -19,18 +21,23 @@ const ROLE_PERMISSIONS: Record<UserRole, ReadonlySet<Permission>> = {
     "scan:read",
     "scan:create",
     "finding:read",
-    "audit:read"
+    "audit:read",
+    "remediation:create",
+    "remediation:read"
   ]),
   operator: new Set<Permission>([
     "project:read",
     "scan:read",
     "scan:create",
-    "finding:read"
+    "finding:read",
+    "remediation:create",
+    "remediation:read"
   ]),
   viewer: new Set<Permission>([
     "project:read",
     "scan:read",
-    "finding:read"
+    "finding:read",
+    "remediation:read"
   ])
 };
 

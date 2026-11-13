@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { verifyJwtToken, JwtVerifierConfig } from "../../src/auth/jwt-verifier.js";
+import { classifyJwtVerificationFailure, verifyJwtToken, JwtVerifierConfig } from "../../src/auth/jwt-verifier.js";
 import { hasPermission, assertPermission } from "../../src/rbac/guard.js";
 import {
   mintTestJwt,
@@ -34,6 +34,29 @@ test("verifyJwtToken: valid RS256 token populates security context", () => {
   assert.equal(res.securityContext.identity.tenantId, "tnt-456");
   assert.deepEqual(res.securityContext.identity.roles, ["admin", "operator"]);
   assert.equal(res.securityContext.identity.email, "admin@example.com");
+  assert.equal(classifyJwtVerificationFailure(res), undefined);
+});
+
+test("JWT failure diagnostics map verifier errors to fixed safe categories", () => {
+  const cases = [
+    ["Invalid issuer: raw issuer detail", "issuer_mismatch"],
+    ["Invalid audience: raw audience detail", "audience_mismatch"],
+    ["Missing or invalid Entra 'tid' tenant GUID", "tenant_mismatch"],
+    ["Token has expired", "token_expired"],
+    ["Token not active yet (nbf)", "token_not_yet_valid"],
+    ["Unsupported Entra token type", "idtyp_missing_or_invalid"],
+    ["Entra client application is not allowed", "azp_missing_or_not_allowed"],
+    ["Missing or invalid roles claim", "roles_missing_or_invalid"],
+    ["Unsupported Entra token version", "token_version_invalid"],
+    ["Invalid token signature", "signature_invalid"],
+    ["Key resolution error: secret-bearing detail", "jwks_failure"],
+    ["Malformed JWT token structure", "malformed_token"],
+    ["Unclassified failure with raw claim details", "other_verification_failure"]
+  ] as const;
+
+  for (const [error, expected] of cases) {
+    assert.equal(classifyJwtVerificationFailure({ valid: false, error }), expected);
+  }
 });
 
 test("verifyJwtToken: valid HS256 token requires explicit opt-in", () => {

@@ -26,7 +26,7 @@ const jwtConfig: JwtVerifierConfig = {
   publicKeyOrSecret: "test-only-key"
 };
 
-test("host configuration requires PostgreSQL URL and rejects premature worker activation", () => {
+test("host configuration requires PostgreSQL URL and validates explicit worker activation", () => {
   assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {}), /DATABASE_URL/);
   assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {
     DATABASE_URL: "https://db.invalid/cloudpilot",
@@ -36,11 +36,14 @@ test("host configuration requires PostgreSQL URL and rejects premature worker ac
     DATABASE_URL: "postgresql://user:pass@localhost:55432/cloudpilot_phase08_test",
     CLOUDPILOT_ENABLE_REMEDIATION_WORKER: "yes"
   }), /CLOUDPILOT_ENABLE_REMEDIATION_WORKER/);
-  assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {
+  const enabled = createCloudPilotHostFromEnvironment(jwtConfig, {
     DATABASE_URL: "postgresql://user:pass@localhost:55432/cloudpilot_phase08_test",
     NODE_ENV: "test",
     CLOUDPILOT_ENABLE_REMEDIATION_WORKER: "true"
-  }), /cannot be enabled until approved-artifact execution is integrated/i);
+  });
+  assert.equal(enabled.remediationWorkerEnabled, true);
+  assert.ok(enabled.artifactOnlyRemediationWorker);
+  assert.equal(enabled.artifactOnlyRemediationWorker.autoStart, false);
   assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {
     DATABASE_URL: "postgresql://user:pass@localhost:55432/cloudpilot_phase08_test", HOST: "not-an-ip"
   }), /HOST/);
@@ -67,7 +70,7 @@ test("host wires the GitHub App provider to injected backend environment without
   await host.stop();
 });
 
-test("worker remains disabled by default and explicit activation fails closed", async () => {
+test("worker remains disabled by default and explicit activation composes only the artifact worker", async () => {
   const disabled = createCloudPilotHostFromEnvironment(jwtConfig, {
     DATABASE_URL: "postgresql://user:pass@localhost:55432/cloudpilot_phase08_test",
     NODE_ENV: "test"
@@ -75,11 +78,15 @@ test("worker remains disabled by default and explicit activation fails closed", 
   assert.equal(disabled.remediationWorkerEnabled, false);
   await disabled.stop();
 
-  assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {
+  const enabled = createCloudPilotHostFromEnvironment(jwtConfig, {
     DATABASE_URL: "postgresql://user:pass@localhost:55432/cloudpilot_phase08_test",
     NODE_ENV: "test",
     CLOUDPILOT_ENABLE_REMEDIATION_WORKER: "true"
-  }), /cannot be enabled until approved-artifact execution is integrated/i);
+  });
+  assert.equal(enabled.remediationWorkerEnabled, true);
+  assert.ok(enabled.artifactOnlyRemediationWorker);
+  assert.equal(enabled.githubExecutionCapabilityService != null, true);
+  await enabled.stop();
 });
 
 test("identity provisioning defaults off and organization creation defaults on only in development", async () => {
@@ -377,6 +384,37 @@ test("Phase 4: host start does not launch background recovery loops, queue consu
   await host.stop();
   assert.equal(calls.stop, 1);
   assert.equal(calls.disconnect, 1);
+});
+
+test("explicit host opt-in starts the artifact worker only after database and API readiness and stops it before disconnect", async () => {
+  const calls: string[] = [];
+  const database: HostDatabaseLifecycle = {
+    async connect() { calls.push("database.connect"); },
+    async verify() { calls.push("database.verify"); },
+    async disconnect() { calls.push("database.disconnect"); }
+  };
+  const api: HostApiLifecycle = {
+    async start() { calls.push("api.start"); return 3210; },
+    async stop() { calls.push("api.stop"); }
+  };
+  const credentials = {
+    async getAppAuthenticationCredentials() { calls.push("github.credentials.validate"); return { appId: 1, privateKeyPem: "not-used-in-this-test" }; },
+    async getWebhookVerificationSecret() { return "x".repeat(32); },
+    async getCredentials() { return { appId: 1, privateKeyPem: "not-used-in-this-test", webhookSecret: "x".repeat(32) }; }
+  };
+  const worker = {
+    start(id: string) { calls.push(`worker.start:${id.startsWith("cloudpilot:")}`); },
+    async stop() { calls.push("worker.stop"); }
+  };
+  const host = new CloudPilotApplicationHost(
+    database, api, 0, true, "127.0.0.1", credentials as never, undefined, null, null, null,
+    null, null, null, null, null, worker as never
+  );
+
+  assert.equal(await host.start(), 3210);
+  assert.deepEqual(calls, ["database.connect", "database.verify", "github.credentials.validate", "api.start", "worker.start:true"]);
+  await host.stop();
+  assert.deepEqual(calls.slice(-3), ["worker.stop", "api.stop", "database.disconnect"]);
 });
 
 test("Phase 4: database schema verification checks execution aggregate and event journal tables", async () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ArchitectureDiscoveryResult } from "../../../phase-01/demo-service/src/architecture-discovery.js";
 import { discoverArchitecture } from "../../../phase-01/demo-service/src/architecture-discovery.js";
 import type { ExpectedObservabilityModel, ExpectedRequirement } from "../../../phase-01/demo-service/src/expected-observability.js";
+import { analyzeNodeExpressSource, expectedModelDigest, type SourceObservabilityAnalysis, type SourceSnapshotFile } from "../../../phase-01/demo-service/src/source-observability-analysis.js";
 import type { AuthenticatedRouteContext, AuthenticatedRouteExtension } from "../../../phase-06/src/api/server.js";
 import { hasPermission } from "../../../phase-06/src/rbac/guard.js";
 import { validateProjectTargetConfig } from "../../../phase-06/src/api/validation.js";
@@ -23,6 +24,11 @@ export interface ArchitectureProjectStore {
   saveExpectedModel(tenantId: string, projectId: string, actorId: string, model: ExpectedObservabilityModel): Promise<boolean>;
   mergeExpectedModel(tenantId: string, projectId: string, actorId: string, expectedCurrent: unknown, model: ExpectedObservabilityModel): Promise<boolean>;
   saveTargetConfig(tenantId: string, projectId: string, actorId: string, targetConfig: unknown): Promise<boolean>;
+  saveSourceAnalysis(tenantId: string, projectId: string, actorId: string, expectedCurrent: unknown, model: ExpectedObservabilityModel, analysis: SourceObservabilityAnalysis): Promise<boolean>;
+}
+
+export interface SourceObservabilityDiscoveryService {
+  analyze(files: SourceSnapshotFile[]): SourceObservabilityAnalysis;
 }
 
 const MAX_UPLOAD_FILES = 50;
@@ -30,6 +36,26 @@ const MAX_FILE_BYTES = 64 * 1024;
 const MAX_TOTAL_BYTES = 128 * 1024;
 const EXPECTED_MODEL_VERSION = "cloudpilot.expected-observability.v1";
 const SUPPORTED_SIGNALS = new Set(["metric", "log", "trace", "health", "alert"]);
+
+function sourcePath(value: unknown): value is string {
+  if (typeof value !== "string" || !value || value.length > 512 || value.includes("\\") || value.includes(":") || value.startsWith("/")) return false;
+  const segments = value.split("/");
+  return !segments.some((segment) => !segment || segment === "." || segment === ".." || /[\u0000-\u001f]/.test(segment)) &&
+    /\.(?:js|cjs|mjs|ts|json|yaml|yml)$/i.test(segments[segments.length - 1]) &&
+    !/(^|\/)(\.env(?:\.|$)|node_modules|\.git)(\/|$)/i.test(value);
+}
+
+function mergeSourceModel(current: unknown, derived: ExpectedObservabilityModel): ExpectedObservabilityModel | null {
+  if (current === null || current === undefined || (isObject(current) && Object.keys(current).length === 0)) return derived;
+  if (!validExpectedModel(current) || current.serviceId !== derived.serviceId) return null;
+  const byId = new Map(current.requirements.map((item) => [item.id, item]));
+  for (const item of derived.requirements) {
+    const previous = byId.get(item.id);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(item)) return null;
+    byId.set(item.id, previous ?? item);
+  }
+  return { schemaVersion: EXPECTED_MODEL_VERSION, serviceId: derived.serviceId, requirements: [...byId.values()].sort((a, b) => a.id.localeCompare(b.id)) };
+}
 
 function invalidResult(message: string): ArchitectureDiscoveryResult {
   return {
@@ -141,11 +167,14 @@ export class PrismaArchitectureProjectStore implements ArchitectureProjectStore 
 
   async saveTargetConfig(tenantId: string, projectId: string, actorId: string, targetConfig: unknown): Promise<boolean> {
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.project.updateMany({
-        where: { id: projectId, tenantId },
-        data: { targetConfig: targetConfig as Prisma.InputJsonValue }
-      });
-      if (updated.count !== 1) return false;
+      const updated = await tx.$executeRaw`
+        UPDATE projects
+        SET target_config = ${JSON.stringify(targetConfig)}::jsonb ||
+          CASE WHEN target_config ? 'sourceAnalysis' THEN jsonb_build_object('sourceAnalysis', target_config->'sourceAnalysis') ELSE '{}'::jsonb END,
+            updated_at = NOW()
+        WHERE id = ${projectId} AND tenant_id = ${tenantId}
+      `;
+      if (updated !== 1) return false;
       await tx.auditEvent.create({
         data: {
           tenantId, actorId, action: "PROJECT_TELEMETRY_TARGET_UPDATED", resourceType: "project",
@@ -156,6 +185,36 @@ export class PrismaArchitectureProjectStore implements ArchitectureProjectStore 
           }
         }
       });
+      return true;
+    });
+  }
+
+  async saveSourceAnalysis(tenantId: string, projectId: string, actorId: string, expectedCurrent: unknown, model: ExpectedObservabilityModel, analysis: SourceObservabilityAnalysis): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const expectedJson = expectedCurrent === null ? null : JSON.stringify(expectedCurrent);
+      const sourceMetadata = {
+        sourceDigest: analysis.sourceDigest,
+        modelDigest: expectedModelDigest(model),
+        serviceName: analysis.serviceName ?? null,
+        inspectedPaths: [...new Set([...analysis.routes.map((route) => route.evidence.path), ...Object.values(analysis.evidenceByRequirement).flat().map((evidence) => evidence.path)])].sort(),
+        metricConfigs: analysis.metricConfigs,
+        evidenceByRequirement: analysis.evidenceByRequirement,
+        findings: analysis.findings
+      };
+      const updated = await tx.$executeRaw`
+        UPDATE projects
+        SET expected_model = ${JSON.stringify(model)}::jsonb,
+            target_config = COALESCE(target_config, '{}'::jsonb) || ${JSON.stringify({ sourceAnalysis: sourceMetadata })}::jsonb,
+            updated_at = NOW()
+        WHERE id = ${projectId} AND tenant_id = ${tenantId}
+          AND expected_model IS NOT DISTINCT FROM ${expectedJson}::jsonb
+      `;
+      if (updated !== 1) return false;
+      await tx.auditEvent.create({ data: {
+        tenantId, actorId, action: "PROJECT_SOURCE_OBSERVABILITY_ANALYZED", resourceType: "project",
+        resourceId: projectId, projectId,
+        metadataJson: { sourceDigest: analysis.sourceDigest, serviceId: model.serviceId, requirementCount: model.requirements.length, findingCount: analysis.findings.length }
+      } });
       return true;
     });
   }
@@ -207,10 +266,41 @@ function routeProjectId(pathname: string, suffix: string): string | null {
 export class ArchitectureApiRoutes implements AuthenticatedRouteExtension {
   constructor(
     private readonly projects: ArchitectureProjectStore,
-    private readonly discovery: ArchitectureDiscoveryService = new LocalManifestArchitectureDiscovery()
+    private readonly discovery: ArchitectureDiscoveryService = new LocalManifestArchitectureDiscovery(),
+    private readonly sourceDiscovery: SourceObservabilityDiscoveryService = { analyze: analyzeNodeExpressSource }
   ) {}
 
   async handle(context: AuthenticatedRouteContext): Promise<boolean> {
+    const sourceAnalysisId = routeProjectId(context.pathname, "source-observability-analysis");
+    const sourceAnalysisApplyId = routeProjectId(context.pathname, "source-observability-analysis/apply");
+    const sourceRouteId = sourceAnalysisApplyId ?? sourceAnalysisId;
+    if (sourceRouteId !== null && context.method === "POST") {
+      if (!hasPermission(context.identity, "project:update")) { context.sendJson(403, { error: "Forbidden: insufficient permissions." }); return true; }
+      if (!await this.projects.exists(context.identity.tenantId, sourceRouteId)) { context.sendJson(404, { error: "Project not found." }); return true; }
+      let body: unknown;
+      try { body = await context.parseJsonBody(); } catch { context.sendJson(400, { error: "Invalid or oversized source snapshot." }); return true; }
+      if (!isObject(body) || !Array.isArray(body.files) || body.files.length < 1 || body.files.length > 120 ||
+          body.files.some((file) => !isObject(file) || !sourcePath(file.path) || typeof file.content !== "string")) {
+        context.sendJson(400, { error: "Source snapshot must contain 1 to 120 safe relative source/configuration files." }); return true;
+      }
+      const files = body.files as SourceSnapshotFile[];
+      const totalBytes = files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+      if (files.some((file) => Buffer.byteLength(file.content, "utf8") > 256 * 1024) || totalBytes > 448 * 1024) {
+        context.sendJson(413, { error: "Source snapshot exceeds per-file or total upload limits." }); return true;
+      }
+      const analysis = this.sourceDiscovery.analyze(files);
+      if (sourceAnalysisApplyId === null) { context.sendJson(200, analysis); return true; }
+      if (analysis.status === "invalid" || analysis.status === "unsupported" || analysis.expectedModel.requirements.length === 0 ||
+          !(body.expectedCurrentModel === null || body.expectedCurrentModel === undefined || validExpectedModel(body.expectedCurrentModel))) {
+        context.sendJson(400, { error: "A supported Express snapshot and a valid expectedCurrentModel baseline are required to apply source analysis.", diagnostics: analysis.diagnostics }); return true;
+      }
+      const merged = mergeSourceModel(body.expectedCurrentModel ?? null, analysis.expectedModel);
+      if (!merged) { context.sendJson(409, { error: "Source requirements conflict with the current model or service. Review the existing model and retry." }); return true; }
+      const saved = await this.projects.saveSourceAnalysis(context.identity.tenantId, sourceRouteId, context.identity.userId, body.expectedCurrentModel ?? null, merged, analysis);
+      if (!saved) { context.sendJson(409, { error: "The expected model changed during source analysis. Reload the project and analyze again." }); return true; }
+      context.sendJson(200, { ...analysis, expectedModel: merged, saved: true });
+      return true;
+    }
     const mergeId = routeProjectId(context.pathname, "expected-model/merge");
     if (mergeId !== null && context.method === "POST") {
       if (!hasPermission(context.identity, "project:update")) { context.sendJson(403, { error: "Forbidden: insufficient permissions." }); return true; }

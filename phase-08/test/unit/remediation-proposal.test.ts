@@ -110,6 +110,7 @@ function fakePrisma(state = initialState()) {
     return client;
   };
   const root = makeClient(state);
+  root.remediationExecution = { async findFirst() { return null; } };
   root.$transaction = (callback: (tx: any) => Promise<unknown>) => {
     const result = transactionQueue.then(async () => {
       const working = cloneState(state);

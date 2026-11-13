@@ -44,7 +44,8 @@ const MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ] as const;
 
 // Known-valid seed values

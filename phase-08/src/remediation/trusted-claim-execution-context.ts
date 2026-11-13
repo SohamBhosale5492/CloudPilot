@@ -3,6 +3,7 @@ import type { RemediationLease } from "../jobs/remediation-repo.js";
 import { hasOrganizationPermission } from "../organizations/permissions.js";
 import { verifyPlanSnapshotIntegrity } from "../api/remediation-proposal-repo.js";
 import { verifyExecutionArtifact, type RemediationExecutionArtifact } from "./execution-artifact.js";
+import { lockActiveBindingInstallation, lockActiveMember, lockActiveOrganization, lockScopedFinding } from "./postgres-lock-helpers.js";
 
 const contextBrand: unique symbol = Symbol("TrustedClaimExecutionContext");
 const trustedContexts = new WeakSet<object>();
@@ -127,19 +128,27 @@ class PrismaTrustedClaimExecutionContextRepository implements TrustedClaimExecut
       // Lock every authorization-bearing row until context issuance. Concurrent
       // revocation/reassignment either commits before these locks (and fails the
       // predicates) or waits until this serializable preparation has completed.
+      const bindingIdentity = await tx.projectGitHubRepository.findFirst({
+        where: { id: remediation.repositoryBindingId, tenantId: remediation.tenantId,
+          organizationId: remediation.organizationId, projectId: remediation.projectId,
+          githubRepositoryId: remediation.githubRepositoryId },
+        select: { installationRecordId: true }
+      });
+      if (!bindingIdentity) return null;
       const authorizationLocks = await Promise.all([
-        tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM organizations WHERE id = ${remediation.organizationId}::uuid AND status = 'active' FOR SHARE`,
+        lockActiveOrganization(tx, remediation.organizationId),
         tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM projects WHERE id = ${remediation.projectId} AND tenant_id = ${remediation.tenantId} AND organization_id = ${remediation.organizationId}::uuid FOR SHARE`,
         tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM scans WHERE id = ${remediation.scanId} AND tenant_id = ${remediation.tenantId} AND project_id = ${remediation.projectId} FOR SHARE`,
-        tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM findings WHERE id = ${remediation.findingId} AND tenant_id = ${remediation.tenantId} AND project_id = ${remediation.projectId} AND scan_id = ${remediation.scanId} FOR SHARE`,
+        lockScopedFinding(tx, remediation.tenantId, remediation.projectId, remediation.scanId, remediation.findingId),
         tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM project_organization_adoptions WHERE tenant_id = ${remediation.tenantId} AND organization_id = ${remediation.organizationId}::uuid AND project_id = ${remediation.projectId} AND status = 'approved' FOR SHARE`,
-        tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM project_github_repositories WHERE id = ${remediation.repositoryBindingId}::uuid AND tenant_id = ${remediation.tenantId} AND organization_id = ${remediation.organizationId}::uuid AND project_id = ${remediation.projectId} AND github_repository_id = ${remediation.githubRepositoryId} AND status = 'active' FOR SHARE`,
-        tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM organization_github_installations WHERE id = (SELECT installation_record_id FROM project_github_repositories WHERE id = ${remediation.repositoryBindingId}::uuid AND tenant_id = ${remediation.tenantId} AND organization_id = ${remediation.organizationId}::uuid AND project_id = ${remediation.projectId}) AND organization_id = ${remediation.organizationId}::uuid AND status = 'active' FOR SHARE`,
+        lockActiveBindingInstallation(tx, { tenantId: remediation.tenantId, organizationId: remediation.organizationId,
+          projectId: remediation.projectId, bindingId: remediation.repositoryBindingId,
+          installationId: bindingIdentity.installationRecordId, githubRepositoryId: remediation.githubRepositoryId.toString() }),
         tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM identity_users WHERE id = ${remediation.requestedByIdentityUserId}::uuid AND status = 'active' FOR SHARE`,
         tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM identity_users WHERE id = ${remediation.approvedByIdentityUserId}::uuid AND status = 'active' FOR SHARE`,
-        tx.$queryRaw<Array<{ id: string }>>`SELECT organization_id AS id FROM organization_members WHERE organization_id = ${remediation.organizationId}::uuid AND user_id = ${remediation.approvedByIdentityUserId}::uuid AND status = 'active' FOR SHARE`
+        lockActiveMember(tx, remediation.organizationId, remediation.approvedByIdentityUserId)
       ]);
-      if (authorizationLocks.some((rows) => rows.length !== 1)) return null;
+      if (authorizationLocks.some((result) => Array.isArray(result) ? result.length !== 1 : !result)) return null;
 
       const [organization, project, scan, finding, adoption, binding, identities, membership] = await Promise.all([
         tx.organization.findUnique({ where: { id: remediation.organizationId }, select: { status: true } }),

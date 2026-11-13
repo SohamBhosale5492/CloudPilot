@@ -285,7 +285,20 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     if (!member || !hasOrganizationPermission(member.role, "remediation:read")) throw new RemediationProposalError(404, "Remediation proposal not found.");
     assertPlanSnapshotIntegrity(row);
     assertArtifactIntegrity(row);
-    return publicProposal(row);
+    const execution = await this.prisma.remediationExecution.findFirst({
+      where: { remediationId: row.id, tenantId: row.tenant_id, organizationId: row.organization_id, projectId: row.project_id },
+      select: { status: true, stage: true, attemptNumber: true, commitSha: true, branchName: true,
+        pullRequestNumber: true, pullRequestUrl: true, failureCode: true, updatedAt: true }
+    });
+    return { ...publicProposal(row), permissions: {
+      prepareArtifact: hasOrganizationPermission(member.role, "remediation:create"),
+      approve: hasOrganizationPermission(member.role, "remediation:approve")
+    }, execution: execution ? {
+      status: execution.status, stage: execution.stage, attemptNumber: execution.attemptNumber,
+      commitSha: execution.commitSha, branchName: execution.branchName,
+      pullRequestNumber: execution.pullRequestNumber, pullRequestUrl: execution.pullRequestUrl,
+      failureCode: execution.failureCode, updatedAt: execution.updatedAt.toISOString()
+    } : null };
   }
 
   /**

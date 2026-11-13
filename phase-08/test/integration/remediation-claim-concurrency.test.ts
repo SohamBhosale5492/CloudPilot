@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import { Prisma, PrismaClient } from "@prisma/client";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 import { planRemediation, type FindingSummary } from "../../../phase-07/src/remediation/planner.js";
 import { RemediationJobRepository } from "../../src/jobs/remediation-repo.js";
 import { PrismaRemediationExecutionLifecycle } from "../../src/jobs/remediation-execution-lifecycle.js";
@@ -11,9 +12,12 @@ import { RemediationExecutionPersistenceService } from "../../src/remediation/re
 import { renderExecutionArtifact } from "../../src/remediation/execution-artifact.js";
 import { TrustedClaimExecutionContextService } from "../../src/remediation/trusted-claim-execution-context.js";
 
-const DATABASE_URL = process.env.CLOUDPILOT_CLAIM_CONCURRENCY_FRESH_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const DATABASE_URL = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_CLAIM_CONCURRENCY_FRESH_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_claim_concurrency_fresh_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_claim_concurrency_fresh_test";
 if (!DATABASE_URL) {
-  throw new Error("CLOUDPILOT_CLAIM_CONCURRENCY_FRESH_TEST_DATABASE_URL is required; no fallback is permitted.");
+  throw new Error("An explicit dedicated concurrency or Phase 08 acceptance database URL is required; no fallback is permitted.");
 }
 
 const MIGRATIONS = [
@@ -33,7 +37,8 @@ const MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ] as const;
 
 const ARTIFACT_HASH_SEED = "a".repeat(64);
@@ -42,6 +47,10 @@ const CANDIDATE_QUERY_MARKER = "FOR UPDATE OF r SKIP LOCKED";
 type TransactionOptions = { maxWait?: number; timeout?: number; isolationLevel?: Prisma.TransactionIsolationLevel };
 
 function validateDatabaseUrl(value: string): URL {
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return new URL(acceptanceDatabase.url);
+  }
   let url: URL;
   try { url = new URL(value); }
   catch { throw new Error("Concurrency database URL is malformed."); }
@@ -302,8 +311,8 @@ test("independent PostgreSQL transactions allow exactly one durable remediation 
       database: string; username: string; serverAddress: string | null; serverPort: number; readOnly: string;
     }>>`SELECT current_database() AS database, current_user AS username, inet_server_addr()::text AS "serverAddress",
               inet_server_port() AS "serverPort", current_setting('transaction_read_only') AS "readOnly";`;
-    assert.equal(identityRows[0]?.database, "cloudpilot_claim_concurrency_fresh_test");
-    assert.equal(identityRows[0]?.username, "cloudpilot_claim_concurrency_fresh_test");
+    assert.equal(identityRows[0]?.database, expectedDatabase);
+    assert.equal(identityRows[0]?.username, expectedUsername);
     assert.equal(Number(identityRows[0]?.serverPort), 5432);
     assert.ok(isPrivateContainerAddress(identityRows[0]?.serverAddress ?? null), "server address must be private container IPv4");
     assert.equal(identityRows[0]?.readOnly, "off", "the disposable test database must accept fixture writes");

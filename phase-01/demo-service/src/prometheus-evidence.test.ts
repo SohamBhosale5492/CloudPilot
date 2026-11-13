@@ -111,7 +111,9 @@ function vectorResult(value: string, labels: Record<string, string> = {}) {
   return {
     metric: {
       __name__: "demo_http_server_requests_total",
-      service_name: "demo-service",
+      exported_job: "demo-service",
+      job: "otel-collector",
+      instance: "otel-collector:8889",
       route: "/api/demo",
       method: "GET",
       status_code: "200",
@@ -136,7 +138,7 @@ function collectWithResponses(responses: Response[]) {
 test("builds an increase query using actual Prometheus labels", () => {
   assert.equal(
     buildPrometheusRequestMetricQuery(requirement, 60),
-    'sum by (service_name,route,method,status_code) (increase(demo_http_server_requests_total{service_name="demo-service",route="/api/demo",method="GET"}[60s]))'
+    'sum by (exported_job,route,method,status_code,job,instance) (increase(demo_http_server_requests_total{exported_job="demo-service",job="otel-collector",route="/api/demo",method="GET"}[60s]))'
   );
 });
 
@@ -185,6 +187,80 @@ test("collects one matching Prometheus series into evaluator evidence", async ()
       }
     ]
   });
+});
+
+test("maps the observed Collector series into the normalized serviceName evidence field", async () => {
+  const evidence = await collectWithResponses([
+    jsonResponse(coverageResult()),
+    jsonResponse(vectorResponse([{
+      metric: {
+        __name__: "demo_http_server_requests_total",
+        exported_job: "demo-service",
+        job: "otel-collector",
+        instance: "otel-collector:8889",
+        route: "/api/demo",
+        method: "GET",
+        status_code: "200"
+      },
+      value: [1791892800, "5"]
+    }]))
+  ]);
+  const finding = evaluateRequestMetricRequirement({
+    requirement,
+    evidence,
+    evaluatedAt: evaluatedAt.toISOString()
+  });
+
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.samples, [{
+    metricName: "demo_http_server_requests_total",
+    labels: { serviceName: "demo-service", route: "/api/demo", method: "GET", statusCode: "200" },
+    value: 5
+  }]);
+  assert.equal(finding.outcome, "pass");
+});
+
+test("accepts an aggregated result without the Prometheus metric-name label", async () => {
+  const evidence = await collectWithResponses([
+    jsonResponse(coverageResult()),
+    jsonResponse(vectorResponse([{
+      metric: {
+        exported_job: "demo-service",
+        job: "otel-collector",
+        instance: "otel-collector:8889",
+        route: "/api/demo",
+        method: "GET",
+        status_code: "200"
+      },
+      value: [1791892800, "5"]
+    }]))
+  ]);
+
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.samples, [{
+    metricName: requirement.metricName,
+    labels: { serviceName: "demo-service", route: "/api/demo", method: "GET", statusCode: "200" },
+    value: 5
+  }]);
+});
+
+test("empty successful metric results remain complete empty evidence, not a fabricated metric", async () => {
+  const evidence = await collectWithResponses([
+    jsonResponse(coverageResult()),
+    jsonResponse(vectorResponse([]))
+  ]);
+  const finding = evaluateRequestMetricRequirement({
+    requirement,
+    evidence,
+    evaluatedAt: evaluatedAt.toISOString()
+  });
+
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.samples, []);
+  assert.equal(finding.outcome, "gap");
 });
 
 test("collects multiple distinct series and preserves labels", async () => {
@@ -260,7 +336,7 @@ test("sparse coverage samples are incomplete", async () => {
   assert.equal(evidence.complete, false);
 });
 
-test("coverage with missing or mismatched target labels is incomplete", async () => {
+test("coverage requires a Collector job and a non-empty instance label without fixing the instance name", async () => {
   const missingTarget = await collectWithResponses([
     jsonResponse(coverageResultWithSeries({
       metric: {
@@ -273,8 +349,8 @@ test("coverage with missing or mismatched target labels is incomplete", async ()
   const mismatchedTarget = await collectWithResponses([
     jsonResponse(coverageResultWithSeries({
       metric: {
-        job: "otel-collector",
-        instance: "other-target:8889"
+        job: "other-job",
+        instance: "any-target:8889"
       },
       values: coverageValues()
     })),
@@ -285,6 +361,19 @@ test("coverage with missing or mismatched target labels is incomplete", async ()
   assert.equal(missingTarget.complete, false);
   assert.equal(mismatchedTarget.available, true);
   assert.equal(mismatchedTarget.complete, false);
+});
+
+test("coverage accepts a different non-empty Collector instance name", async () => {
+  const evidence = await collectWithResponses([
+    jsonResponse(coverageResultWithSeries({
+      metric: { job: "otel-collector", instance: "collector-replica:8889" },
+      values: coverageValues()
+    })),
+    jsonResponse(vectorResponse([]))
+  ]);
+
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
 });
 
 test("coverage with invalid timestamps is incomplete", async () => {
@@ -475,14 +564,39 @@ test("unexpected returned selector labels return partial evidence", async () => 
   assert.equal(evidence.complete, false);
 });
 
-test("unexpected returned labels outside the normalized contract return partial evidence", async () => {
+test("unexpected service and method labels return partial evidence", async () => {
+  const mismatchedLabels: Array<Record<string, string>> = [
+    { exported_job: "other-service" },
+    { method: "POST" }
+  ];
+
+  for (const labels of mismatchedLabels) {
+    const evidence = await collectWithResponses([
+      jsonResponse(coverageResult()),
+      jsonResponse(vectorResponse([vectorResult("1", labels)]))
+    ]);
+
+    assert.equal(evidence.available, true);
+    assert.equal(evidence.complete, false);
+    assert.deepEqual(evidence.samples, []);
+  }
+});
+
+test("known Collector target labels are accepted while arbitrary labels return partial evidence", async () => {
+  const collectorLabelsEvidence = await collectWithResponses([
+    jsonResponse(coverageResult()),
+    jsonResponse(vectorResponse([vectorResult("1", { job: "otel-collector", instance: "collector-replica:8889" })]))
+  ]);
   const evidence = await collectWithResponses([
     jsonResponse(coverageResult()),
     jsonResponse(vectorResponse([
-      vectorResult("1", { instance: "otel-collector:8889" })
+      vectorResult("1", { pod_name: "demo-pod" })
     ]))
   ]);
 
+  assert.equal(collectorLabelsEvidence.available, true);
+  assert.equal(collectorLabelsEvidence.complete, true);
+  assert.equal(collectorLabelsEvidence.samples.length, 1);
   assert.equal(evidence.available, true);
   assert.equal(evidence.complete, false);
 });
@@ -542,7 +656,7 @@ test("query URLs preserve configured base paths and explicit query time", async 
 
   assert.equal(evidence.collectedAt, evaluatedAt.toISOString());
   assert.equal(requestedUrls[0]?.pathname, "/prometheus/api/v1/query_range");
-  assert.equal(requestedUrls[0]?.searchParams.get("query"), 'timestamp(up{job="otel-collector",instance="otel-collector:8889"} == 1)');
+  assert.equal(requestedUrls[0]?.searchParams.get("query"), 'timestamp(up{job="otel-collector"} == 1)');
   assert.equal(requestedUrls[0]?.searchParams.get("start"), "1791892740");
   assert.equal(requestedUrls[0]?.searchParams.get("end"), "1791892800");
   assert.equal(requestedUrls[0]?.searchParams.get("step"), "5s");

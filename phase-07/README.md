@@ -46,32 +46,11 @@ Phase 07 implements automated, explainable remediation via GitHub sandbox branch
 - Outbound redirects to non-GitHub domains are unconditionally blocked (`redirect: "error"`).
 - Decrementing retry budget (`retries_left`, default 3) transitions persistent failures into terminal `failed` status without unbounded loops.
 
-## Database Schema
+## Database schema and migrations
 
-```prisma
-model Remediation {
-  id             String    @id @default(uuid())
-  tenantId       String    @map("tenant_id")
-  projectId      String    @map("project_id")
-  scanId         String    @map("scan_id")
-  findingId      String    @map("finding_id")
-  idempotencyKey String    @unique @map("idempotency_key")
-  status         String    // "pending" | "open" | "merged" | "closed" | "failed"
-  branchName     String?   @map("branch_name")
-  prNumber       Int?      @map("pr_number")
-  prUrl          String?   @map("pr_url")
-  patchSummary   String?   @map("patch_summary")
-  errorMessage   String?   @map("error_message")
-  retriesLeft    Int       @default(3) @map("retries_left")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+The authoritative schema for the composed application is [`phase-08/prisma/schema.prisma`](../phase-08/prisma/schema.prisma); the authoritative ordered migration history is its adjacent `migrations/` directory. It includes the Phase 06 core models, Phase 07 remediation records, and Phase 08 lease/fencing fields. The Phase 07 schema and migrations are retained as historical references and compatibility evidence, not as an independent deployment source. Phase 07 exposes no separate Prisma generation or migration deployment script; its package configuration points install-time client generation to the canonical schema.
 
-  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  project Project @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
-  scan    Scan    @relation(fields: [tenantId, scanId], references: [tenantId, id], onDelete: Cascade)
-  finding Finding @relation(fields: [findingId], references: [id], onDelete: Cascade)
-}
-```
+Generate the client using `npm --prefix phase-08 run prisma:generate`. Verify the canonical schema, duplicated historical SQL, package pins, and composed runtime client using `npm --prefix phase-08 run prisma:check`. Only deployment operators may apply the ordered migrations with `npm --prefix phase-08 run prisma:migrate` after verifying the target database and migration history. Application hosts never apply migrations automatically.
 
 ## Running Tests
 
@@ -82,7 +61,16 @@ npm --prefix phase-07 run test:unit
 ```
 
 ### Integration Tests
-Integration tests run against the live local PostgreSQL instance and a local mock GitHub HTTP server:
+Integration tests require `CLOUDPILOT_FIXTURE_TEST_DATABASE_URL`, guarded for the dedicated `cloudpilot_runtime_role_test` database and `cloudpilot_integration_test` role on loopback port `56440`; they also use a local mock GitHub HTTP server. This fixture-only role is separate from the restricted runtime role and is configured by the target-guarded SQL script in Phase 08. It does not receive ownership, DDL, TRUNCATE, or append-only journal update/delete permissions. The tests perform database-backed fixture writes and are not part of the database-independent unit suite:
 ```bash
 npm --prefix phase-07 run test:integration
 ```
+
+## Local observability demo workflow
+
+Phase 07 also exposes `npm --prefix phase-07 run demo:observability`. It composes the existing Phase 02 architecture discovery, Phase 03 expected model, Phase 04 inspectors, Phase 05 deterministic gap engine, and this phase's allowlisted YAML planner. It is separate from GitHub execution: it uses no GitHub credentials, does not open a pull request, and prints generated YAML without writing it to the inspected workload.
+
+The workflow's full analysis chain is covered with mocked local inspector responses by `test/unit/observability-demo.test.ts`. A live run requires the Phase 01 Compose services and loopback access; see [`../phase-01/README.md`](../phase-01/README.md). Logs, traces, and alerts remain unknown when their Phase 04 adapters are unconfigured. PostgreSQL-backed GitHub remediation integration tests are a separate acceptance gate and were not run by this demo workflow.
+# Composed application bootstrap
+
+Phase 07 provides GitHub remediation components and a backward-compatible orchestration layer for controlled tests and internal use. The production application process is `phase-08/src/main.ts`; the Phase 08 host currently rejects `CLOUDPILOT_ENABLE_REMEDIATION_WORKER=true`, so this legacy executor is not activated by the production host. Build and start through the Phase 08 package; Phase 07 is not a separate production host or migration deployment entry point. See the Phase 08 README for runtime configuration and lifecycle details.

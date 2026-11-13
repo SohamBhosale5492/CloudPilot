@@ -34,18 +34,36 @@ export interface TrustedOrganizationGitHubAuthorizationService {
     readonly permission: OrganizationGitHubPermission;
   }): Promise<AuthorizedGitHubRepositoryAccess>;
 }
-/**
- * Trusted persistence adapter. A future installation/binding implementation
- * must verify active installation state and return only server-persisted
- * immutable GitHub identifiers. It receives the same transaction as the
- * membership/project/adoption checks to avoid mixing authorization snapshots.
- * The current schema has no such binding, so the host uses a deny-all adapter.
- */
+/** Persistence adapter resolves a binding and active installation in the caller's authorization transaction. */
 export interface GitHubRepositoryBindingResolver {
   findActiveBinding(tx: Prisma.TransactionClient, input: { organizationId: string; tenantId: string; projectId: string }): Promise<{
     installationId: string;
     repositoryId: string;
   } | null>;
+}
+
+/** Resolves only the active persisted binding scoped to the authorized project and organization. */
+export class PrismaGitHubRepositoryBindingResolver implements GitHubRepositoryBindingResolver {
+  async findActiveBinding(tx: Prisma.TransactionClient, input: { organizationId: string; tenantId: string; projectId: string }) {
+    const binding = await tx.projectGitHubRepository.findFirst({
+      where: {
+        organizationId: input.organizationId,
+        tenantId: input.tenantId,
+        projectId: input.projectId,
+        status: "active",
+        installation: { is: { organizationId: input.organizationId, status: "active" } }
+      },
+      select: {
+        githubRepositoryId: true,
+        installation: { select: { githubInstallationId: true } }
+      }
+    });
+    if (!binding || binding.githubRepositoryId <= 0n || binding.installation.githubInstallationId <= 0n) return null;
+    return {
+      repositoryId: binding.githubRepositoryId.toString(10),
+      installationId: binding.installation.githubInstallationId.toString(10)
+    };
+  }
 }
 
 export class GitHubRepositoryBindingUnavailableError extends Error {
@@ -120,7 +138,7 @@ export class PrismaTrustedOrganizationGitHubAuthorizationService implements Trus
   }
 }
 
-/** Safe until the installation/binding persistence stage is implemented. */
+/** Explicit deny-all resolver for tests or deployments that intentionally disable repository access. */
 export class NoGitHubRepositoryBindingResolver implements GitHubRepositoryBindingResolver {
   async findActiveBinding(): Promise<null> { return null; }
 }

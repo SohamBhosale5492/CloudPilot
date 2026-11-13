@@ -492,6 +492,19 @@ test("log, trace, and alert gap rules return unknown with BACKEND_UNCONFIGURED",
   assert.equal(alertFinding.rule.id, alertGapRule.id);
 });
 
+test("trace rules correlate complete service-matched Jaeger evidence and preserve unknown on unavailable evidence", () => {
+  const requirement: ExpectedTraceRequirement = { id: "trace-correlated", signal: "trace", serviceName: "alumni-api" };
+  const available: InspectorEvidence = {
+    signal: "trace", requirementId: requirement.id, collectedAt: NOW_ISO, available: true, complete: true,
+    provenance: { target: "http://jaeger:16686/api/traces", adapter: "jaeger-query" },
+    data: { serviceName: "alumni-api", traceCount: 2 }, diagnostics: []
+  };
+  assert.equal(evaluateGap(requirement, available, { evaluatedAt: NOW }).outcome, "pass");
+  assert.equal(evaluateGap(requirement, { ...available, data: { serviceName: "alumni-api", traceCount: 0 } }, { evaluatedAt: NOW }).outcome, "gap");
+  assert.equal(evaluateGap(requirement, { ...available, data: { serviceName: "other", traceCount: 3 } }, { evaluatedAt: NOW }).outcome, "inconclusive");
+  assert.equal(evaluateGap(requirement, makeUnconfiguredEvidence("trace", requirement.id), { evaluatedAt: NOW }).outcome, "unknown");
+});
+
 // ─── Batch evaluation tests ────────────────────────────────────────────────────
 
 test("batch evaluation produces deterministic findings for all five signal families", () => {

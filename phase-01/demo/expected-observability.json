@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "cloudpilot.expected-observability.v1",
+  "serviceId": "demo-service",
+  "requirements": {
+    "metrics": [
+      {
+        "id": "demo-request-count",
+        "signal": "metric",
+        "metricName": "demo_http_server_requests_total",
+        "dimensions": ["exported_job", "route", "method", "status_code"]
+      },
+      {
+        "id": "cloudpilot_demo_queue_depth",
+        "signal": "metric",
+        "metricName": "cloudpilot_demo_queue_depth",
+        "dimensions": ["exported_job"]
+      }
+    ],
+    "logs": [
+      {
+        "id": "demo-structured-logs",
+        "signal": "log",
+        "fields": ["level", "message", "trace_id"]
+      }
+    ],
+    "traces": [
+      {
+        "id": "demo-trace-identity",
+        "signal": "trace",
+        "serviceName": "demo-service"
+      }
+    ],
+    "healthChecks": [
+      {
+        "id": "demo-health",
+        "signal": "health",
+        "kind": "http",
+        "endpoint": "/health"
+      }
+    ],
+    "alerts": [
+      {
+        "id": "demo-request-alert",
+        "signal": "alert",
+        "associatedSignal": "metric",
+        "condition": "rate(demo_http_server_requests_total[5m]) > 100",
+        "severity": "warning"
+      }
+    ]
+  }
+}

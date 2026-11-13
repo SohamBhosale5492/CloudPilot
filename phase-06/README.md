@@ -100,32 +100,41 @@ Server-side role-based access control enforces least privilege across three defi
 
 ## Development & Testing
 
-### 1. Starting PostgreSQL
-Start local PostgreSQL via Docker Compose:
-```bash
-docker compose -f phase-06/docker-compose.yml up -d
-```
-Default connection string:
-`postgresql://cloudpilot:cloudpilot_password@localhost:5432/cloudpilot_test`
+### 1. Authoritative Prisma schema and migrations
+The composed CloudPilot application uses [`phase-08/prisma/schema.prisma`](../phase-08/prisma/schema.prisma) and its adjacent `migrations/` directory as its only supported schema and migration source. The Phase 06 migration files remain in this directory as historical references; do not deploy them independently. Phase 06 has no Prisma generation or migration deployment script; its package configuration points Prisma install-time generation to the canonical schema.
 
-### 2. Running Migrations
+Generate the composed application's Prisma client from the canonical schema:
 ```bash
-npx --prefix phase-06 prisma migrate deploy
+npm --prefix phase-08 run prisma:generate
 ```
 
-### 3. Running Unit Tests
+Check schema/migration/client consistency without a database connection:
+```bash
+npm --prefix phase-08 run prisma:check
+```
+
+Deployment operators must configure `DATABASE_URL` for the explicitly approved target and apply migrations with `npm --prefix phase-08 run prisma:migrate`. The host does not apply migrations automatically. See the Phase 08 README for rollout responsibilities and the required pre-deployment checks.
+
+### 2. Running Unit Tests
 Unit tests validate JWT verification, JWKS discovery, key rotation, unknown-kid throttling, ES256 IEEE-P1363 cryptography, SSRF protection, RBAC deny-by-default, URL sanitization, and durable queue mechanics:
 ```bash
 npm --prefix phase-06 run test:unit
 ```
 
-### 4. Running Integration Tests
-Integration tests run against PostgreSQL (strictly no SQLite substitution). The suite validates multi-worker concurrency, `FOR UPDATE SKIP LOCKED` racing, lease renewal, crash recovery, retry exhaustion, and stale worker protection:
+### 3. Running Integration Tests
+The Phase 06 PostgreSQL integration suite requires `CLOUDPILOT_FIXTURE_TEST_DATABASE_URL`, guarded for `cloudpilot_integration_test@127.0.0.1:56440/cloudpilot_runtime_role_test`; it checks the connected identity before fixtures. This is a separate fixture role because legacy tests create tenant/user records and the application runtime role intentionally cannot read or modify those tables. Provision and grant the fixture role only in the disposable test database using the guarded SQL setup documented in Phase 08. Never broaden the production runtime role to satisfy test fixtures.
+
+The suite validates Phase 06 API authorization, tenant isolation, and durable scan behavior:
 ```bash
 npm --prefix phase-06 run test:integration
 ```
+
+Database-backed acceptance is environment-dependent and has not been rerun as part of final submission closure. The test guard now requires the explicit fixture-only role rather than the restricted `cloudpilot_runtime` role. The repository provides a target-guarded grant script; the role and grants still require separate DBA setup in the disposable database. Unit tests do not require this database.
 
 ## Known Limitations & Deferred Capabilities
 - **Distributed Broker**: Employs PostgreSQL `FOR UPDATE SKIP LOCKED` coordination instead of Redis/Celery. External distributed messaging brokers remain deferred until operational load requires dedicated message queuing.
 - **Dynamic JWKS Rotation Over External Network**: Tests run hermetically with mock OIDC discovery and JWKS servers; production deployment requires internet connectivity to the configured identity provider.
 - **Remediation & Mutation**: Phase 06 persists findings only; code patching and GitHub pull request creation are deferred to Phase 07.
+# Composed application bootstrap
+
+The production executable is owned by `phase-08/src/main.ts`; Phase 06 remains the reusable API/authentication infrastructure. Start the composed application with `npm --prefix phase-08 run build` followed by `npm --prefix phase-08 start`. Do not deploy Phase 06 as a separate application host. The composed host uses the canonical Phase 08 Prisma schema and does not apply migrations at startup. See the Phase 08 README for required OIDC, database, binding, health, and shutdown configuration.

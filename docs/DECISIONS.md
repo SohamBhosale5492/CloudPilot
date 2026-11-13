@@ -148,3 +148,107 @@ Append decisions with date, status, rationale, alternatives, consequences and re
 
 ## Deferred choices
 Authentication provider; database row-level security mechanism; exact job/worker implementation; Phase 01 trace backend; production audit retention/integrity controls; AI provider/model and data-boundary configuration.
+
+## SaaS architecture decisions
+
+The following decisions extend, and where stated refine, the historical D-001–D-016 record. Historical entries are retained unchanged. “Approved” records the reviewed SaaS direction; “Proposed for review” identifies policy or implementation detail still requiring approval; “Deferred” is intentionally not selected or implemented.
+
+## D-017: Provider-neutral identity contract
+- **Date:** 2026-11-01
+- **Status:** Approved; identity-provider selection deferred
+- **Decision:** Use a provider-neutral OIDC integration boundary. Validate provider tokens before resolving a CloudPilot identity. Entra remains a possible enterprise SSO provider, not the mandatory SaaS identity model.
+- **Rationale:** CloudPilot needs its own user and organization model that is independent of one identity vendor.
+- **Alternatives:** Make Entra the only identity provider; implement local passwords; couple domain authorization directly to a vendor SDK.
+- **Consequences:** A managed OIDC provider must be selected before production integration. Vendor capability and pricing remain unassessed and unresolved. Provider adapters must not define organization roles.
+- **Review trigger:** Provider selection or a provider-specific capability changes the identity contract.
+
+## D-018: External identity mapping and account-linking safeguards
+- **Date:** 2026-11-01
+- **Status:** Approved
+- **Decision:** CloudPilot owns stable internal user UUIDs. Map an external identity by the validated exact pair `(issuer, subject)`. Email alone must never automatically link identities.
+- **Rationale:** Provider subjects are identity keys within an issuer; email may change, be unverified, or be shared/reassigned.
+- **Alternatives:** Use email as the account key; use provider tenant ID as the CloudPilot user or organization ID.
+- **Consequences:** Account linking requires an explicit flow proving control of both identities; identity creation and linking must be audited. Existing email records do not establish identity ownership.
+- **Review trigger:** The selected provider’s stable subject behavior or account-linking requirements need additional handling.
+
+## D-019: Organization membership and role model
+- **Date:** 2026-11-01
+- **Status:** Approved for the domain model; detailed permission matrix proposed for review
+- **Decision:** CloudPilot owns UUID organization identities. Users can belong to multiple organizations with different database-backed roles: `owner`, `admin`, `operator`, and `viewer`. Owner and admin have distinct privileges.
+- **Rationale:** Customer organizations and per-organization authority must be independent of an identity-provider tenant and global user role.
+- **Alternatives:** One CloudPilot tenant per identity-provider tenant; one global role per user; authorization from token role claims.
+- **Consequences:** Every scoped API, repository, cursor, audit action, and worker operation must resolve membership for the target organization. The exact split of organization-management permissions remains proposed for review.
+- **Review trigger:** The owner/admin permission matrix or additional organization roles require a product decision.
+
+## D-020: Organization creation, ownership, and recovery
+- **Date:** 2026-11-01
+- **Status:** Proposed for review
+- **Decision:** Recommended: create the organization and its initial owner membership atomically; define an audited owner recovery and ownership-transfer process before enabling organization lifecycle operations.
+- **Rationale:** An organization without a valid owner is difficult to administer safely, and partial creation can leave inaccessible data.
+- **Alternatives:** Create an organization first and assign an owner asynchronously; infer ownership from the first project, email, or legacy tenant user.
+- **Consequences:** The organization bootstrap flow, recovery authority, and whether creation is open or gated require approval. Do not infer owners from existing resources or email matches.
+- **Review trigger:** Before implementing organization creation, ownership transfer, recovery, or deletion.
+
+## D-021: Organization request context and authorization
+- **Date:** 2026-11-01
+- **Status:** Approved for database-backed membership authorization; request-context details proposed for review
+- **Decision:** Authorization is based on the authenticated local user’s membership in the requested CloudPilot organization. The organization identifier supplied by a client is not proof of access. Identity-provider roles and frontend state do not grant organization permissions.
+- **Rationale:** A user may hold different roles across organizations, and each resource operation must be scoped to the intended organization.
+- **Alternatives:** Put one active organization or global role in the token; trust the selected organization in the UI; authorize from identity-provider tenant IDs.
+- **Consequences:** Server-side membership checks are required on every scoped operation. Recommended: keep active organization as UI/request context and revalidate it each time; decide route shape and non-enumerating error behavior before implementation.
+- **Review trigger:** API route and active-organization context design is finalized or authorization tests reveal ambiguity.
+
+## D-022: Legacy Tenant compatibility and migration
+- **Date:** 2026-11-01
+- **Status:** Approved
+- **Decision:** Preserve the existing `Tenant` model during the initial identity foundation. Do not rename tenant identifiers directly to organization identifiers. Use additive migrations and an expand → backfill → validate → switch → contract sequence for later resource cutover.
+- **Rationale:** Existing tenant-scoped resources and migration history must remain compatible while CloudPilot introduces independent organizations and memberships.
+- **Alternatives:** Rename `tenantId` in place; rewrite or squash historical migrations; map resource ownership to an individual based on email.
+- **Consequences:** Introduce an explicit legacy Tenant-to-Organization mapping and validate all resource relationships before authorization cutover. Existing resource ownership does not establish an individual user’s ownership; legacy ownership bootstrap remains a proposed process requiring verification.
+- **Review trigger:** Before adding organization references to existing resources or switching any API/worker authorization path.
+
+## D-023: PostgreSQL RLS and connection-pooling strategy
+- **Date:** 2026-11-01
+- **Status:** Deferred
+- **Decision:** Do not enable PostgreSQL row-level security as part of the initial identity foundation. Reconsider it only after transaction-scoped organization context and Prisma connection-pooling behavior are proven.
+- **Rationale:** A pooled connection must not retain organization context between requests; unverified RLS configuration can create false isolation confidence or cross-organization leakage.
+- **Alternatives:** Enable RLS immediately; rely indefinitely on RLS alone; rely only on application checks without evaluating defense in depth.
+- **Consequences:** Application membership checks and tenant-scoped constraints remain mandatory. Any later RLS work must fail closed without context, use a non-bypass application role, and test pooled connection reuse.
+- **Historical clarification:** This refines D-011: RLS evaluation and deployment are deferred until a pool-safe transaction-context design can be demonstrated.
+- **Review trigger:** A tested transaction-context design and RLS threat review are available.
+
+## D-024: Organization-bound GitHub and cloud integrations
+- **Date:** 2026-11-01
+- **Status:** Organization-specific GitHub direction approved; Azure direction subject to reaffirmation; implementation details proposed for review
+- **Decision:** GitHub integrations will be organization-specific and retain the existing remediation executor boundary. Azure remains the initial cloud integration direction, subject to reaffirmation. Billing is deferred.
+- **Rationale:** Shared global credentials do not provide adequate organization isolation; the existing executor should remain reusable and database-independent.
+- **Alternatives:** Continue a single global GitHub token; store raw provider credentials in ordinary database rows; implement multiple cloud providers simultaneously.
+- **Consequences:** Recommended GitHub design uses organization-bound App installations and short-lived installation credentials. Cloud credential type, secret-reference service, Azure reaffirmation, and future provider order remain to be reviewed. D-004's Azure-first target is historical and must be reaffirmed before implementation; this ADR does not claim Azure adapters exist. No provider pricing or capability is assumed.
+- **Review trigger:** Before implementing organization integrations, selecting a secret-management boundary, or expanding beyond Azure.
+
+## D-025: Customer target network isolation
+- **Date:** 2026-11-01
+- **Status:** Approved that unrestricted shared-worker access is prohibited; isolation design proposed for review
+- **Decision:** Customer-controlled network targets must not receive unrestricted network access through shared workers.
+- **Rationale:** A configured target can be used to reach platform metadata, internal services, or another customer’s network.
+- **Alternatives:** Permit arbitrary outbound access from shared workers; rely only on URL parsing or metadata-address checks.
+- **Consequences:** Before SaaS exposure, choose and test an isolation approach such as customer-run agents, tightly constrained egress, or isolated workers. DNS resolution, redirects, private ranges, metadata endpoints, and cross-customer reachability require explicit controls.
+- **Review trigger:** Before enabling customer-configured targets in a shared deployment.
+
+## D-026: Organization deletion, audit retention, and data lifecycle
+- **Date:** 2026-11-01
+- **Status:** Deferred
+- **Decision:** Defer organization deletion behavior and retention periods until export, audit, legal-hold, backup, and recovery requirements are defined.
+- **Rationale:** Cascading deletion or indefinite retention can both conflict with customer expectations and legal obligations; current append-only application writes do not establish tamper-proof retention.
+- **Alternatives:** Hard-delete all organization data immediately; retain all data indefinitely; promise immutable audit records without an integrity design.
+- **Consequences:** Do not expose organization deletion until policy, authorization, audit treatment, and recovery are reviewed. Billing remains outside this decision and is separately deferred.
+- **Review trigger:** Before customer onboarding terms or a production data deletion/export capability is finalized.
+
+## D-027: Additive organization ownership foundation
+- **Date:** 2026-11-01
+- **Status:** Approved for additive schema implementation; migration application, adoption, backfill, and authorization cutover deferred
+- **Decision:** Preserve legacy `Tenant` ownership and add nullable organization ownership to Project, Scan, Finding, Remediation, and project-associated audit records. Add project adoption records and compound ownership constraints so non-NULL organization tuples must be internally consistent. Leave existing rows NULL and retain all legacy constraints.
+- **Rationale:** The schema can support a later verified project-level adoption flow without equating Tenant with Organization, changing legacy API behavior, or inferring individual ownership.
+- **Alternatives:** Rename `tenantId`; backfill from Tenant identity; cut over authorization in the same migration; rely only on application checks for new ownership tuples.
+- **Consequences:** Legacy rows remain valid and continue under Tenant authorization. Cross-resource organization tuple constraints apply when organization ownership is present. Full integrity for unadopted legacy resource chains remains governed by existing constraints until a separately reviewed data validation/backfill milestone. The new migration is additive and is not applied automatically.
+- **Review trigger:** Before applying the migration, introducing adoption writes, validating production data, or changing any resource authorization path.

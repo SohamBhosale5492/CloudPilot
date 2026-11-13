@@ -67,6 +67,11 @@ export interface UnconfiguredEvidenceData {
   reason: string;
 }
 
+export interface TraceEvidenceData {
+  serviceName: string;
+  traceCount: number;
+}
+
 export interface HealthInspectorOptions {
   baseUrl: string;
   requirement: ExpectedHealthCheckRequirement;
@@ -98,6 +103,10 @@ export interface MetricInspectorOptions {
 export interface TraceInspectorOptions {
   requirement: ExpectedTraceRequirement;
   backendUrl?: string;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  allowPrivateIps?: boolean;
+  fetchImpl?: typeof fetch;
   collectedAt?: Date;
 }
 
@@ -120,10 +129,18 @@ export interface InspectorConfiguration {
   logBackendUrl?: string;
   alertBackendUrl?: string;
   timeoutMs?: number;
+  collectionWindowSeconds?: number;
   maxResponseBytes?: number;
   maxRedirects?: number;
   allowPrivateIps?: boolean;
   fetchImpl?: typeof fetch;
+  metricConfigs?: Record<string, {
+    serviceName: string;
+    route: string;
+    method?: string;
+    minimumCount?: number;
+    maxEvidenceAgeMs?: number;
+  }>;
   collectedAt?: Date;
   evaluatedAt?: Date;
 }
@@ -722,31 +739,60 @@ export async function inspectMetric(options: MetricInspectorOptions): Promise<In
   };
 }
 
-export function inspectTrace(options: TraceInspectorOptions): InspectorEvidence<UnconfiguredEvidenceData> {
+export async function inspectTrace(options: TraceInspectorOptions): Promise<InspectorEvidence<TraceEvidenceData | UnconfiguredEvidenceData>> {
   const requirementId = options?.requirement?.id ?? "<unknown>";
   const collectedAt = (options?.collectedAt ?? new Date()).toISOString();
-
-  return {
-    signal: "trace",
-    requirementId,
-    collectedAt,
-    available: false,
-    complete: false,
-    provenance: {
-      target: options?.backendUrl ?? options?.requirement?.serviceName ?? "<unconfigured>",
-      adapter: "unconfigured-trace-adapter"
-    },
-    data: {
-      reason: "Trace backend adapter is not configured in this environment."
-    },
-    diagnostics: [
-      {
-        code: "BACKEND_UNCONFIGURED",
-        severity: "info",
-        message: "Trace inspection backend is not configured in Phase 04."
-      }
-    ]
+  const backendUrl = options?.backendUrl;
+  if (!backendUrl) return {
+    signal: "trace", requirementId, collectedAt, available: false, complete: false,
+    provenance: { target: options?.requirement?.serviceName ?? "<unconfigured>", adapter: "jaeger-query" },
+    data: { reason: "Jaeger trace backend is not configured for this project." },
+    diagnostics: [{ code: "BACKEND_UNCONFIGURED", severity: "info", message: "Jaeger trace inspection backend is not configured." }]
   };
+
+  const base = validateAndSanitizeUrl(backendUrl, { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!base.valid || !base.sanitizedUrl) return traceUnavailable(requirementId, collectedAt, "<invalid-url>", base.diagnosticCode ?? "TARGET_INVALID", base.reason ?? "Invalid Jaeger target URL.");
+  const url = new URL(base.sanitizedUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/api/traces`;
+  url.searchParams.set("service", options.requirement.serviceName);
+  url.searchParams.set("lookback", "1h");
+  url.searchParams.set("limit", "20");
+  const validatedTarget = validateAndSanitizeUrl(url.toString(), { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!validatedTarget.valid || !validatedTarget.sanitizedUrl) return traceUnavailable(requirementId, collectedAt, "<invalid-url>", validatedTarget.diagnosticCode ?? "TARGET_INVALID", validatedTarget.reason ?? "Invalid Jaeger query URL.");
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBytes = options.maxResponseBytes ?? 256 * 1024;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await (options.fetchImpl ?? fetch)(validatedTarget.sanitizedUrl, { method: "GET", signal: controller.signal, redirect: "manual", headers: { accept: "application/json" } });
+    if (response.status >= 300 && response.status < 400) return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "REDIRECT_DISALLOWED", "Jaeger query redirects are not followed.", true);
+    if (!response.ok) return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", `Jaeger query returned HTTP ${response.status}.`, true);
+    const body = await readBoundedText(response, maxBytes);
+    if (!body.ok) return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "RESPONSE_TOO_LARGE", "Jaeger response exceeded the configured size limit.", true);
+    let parsed: unknown;
+    try { parsed = JSON.parse(body.text); } catch { return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Jaeger returned malformed JSON.", true); }
+    if (!isRecord(parsed) || !Array.isArray(parsed.data)) return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Jaeger response did not contain a trace data array.", true);
+    let traceCount = 0;
+    for (const item of parsed.data) {
+      if (!isRecord(item) || !Array.isArray(item.spans) || !isRecord(item.processes)) continue;
+      const serviceMatches = Object.values(item.processes).some((process) => isRecord(process) && process.serviceName === options.requirement.serviceName);
+      if (serviceMatches && item.spans.length > 0) traceCount += 1;
+    }
+    return {
+      signal: "trace", requirementId, collectedAt, available: true, complete: true,
+      provenance: { target: validatedTarget.sanitizedUrl, adapter: "jaeger-query" },
+      data: { serviceName: options.requirement.serviceName, traceCount }, diagnostics: []
+    };
+  } catch {
+    return traceUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "PROBE_FAILED", "Jaeger query could not be completed.");
+  } finally { clearTimeout(timer); }
+}
+
+function traceUnavailable(requirementId: string, collectedAt: string, target: string, code: InspectorDiagnosticCode, message: string, available = false): InspectorEvidence<UnconfiguredEvidenceData> {
+  return { signal: "trace", requirementId, collectedAt, available, complete: false,
+    provenance: { target, adapter: "jaeger-query" }, data: { reason: message },
+    diagnostics: [{ code, severity: code === "BACKEND_UNCONFIGURED" ? "info" : "warning", message }] };
 }
 
 export function inspectLog(options: LogInspectorOptions): InspectorEvidence<UnconfiguredEvidenceData> {
@@ -809,9 +855,19 @@ export async function inspectExpectedObservabilityRequirement(
 ): Promise<InspectorEvidence> {
   switch (requirement.signal) {
     case "metric":
+      if (!config.prometheusBaseUrl) {
+        return {
+          signal: "metric", requirementId: requirement.id, collectedAt: (config.collectedAt ?? new Date()).toISOString(),
+          available: false, complete: false, provenance: { target: "<unconfigured>", adapter: "prometheus" },
+          diagnostics: [{ code: "BACKEND_UNCONFIGURED", severity: "info", message: "Prometheus target is not configured for this project." }]
+        };
+      }
       return inspectMetric({
-        baseUrl: config.prometheusBaseUrl ?? "http://prometheus.example.internal:9090",
-        requirement,
+        baseUrl: config.prometheusBaseUrl,
+        requirement: requirement.signal === "metric" && !isRequestMetricRequirement(requirement)
+          ? { ...requirement, ...config.metricConfigs?.[requirement.id] }
+          : requirement,
+        collectionWindowSeconds: config.collectionWindowSeconds,
         timeoutMs: config.timeoutMs,
         allowPrivateIps: config.allowPrivateIps,
         fetchImpl: config.fetchImpl,
@@ -820,8 +876,16 @@ export async function inspectExpectedObservabilityRequirement(
       });
 
     case "health":
+      if (!config.healthBaseUrl) {
+        return {
+          signal: "health", requirementId: requirement.id, collectedAt: (config.collectedAt ?? new Date()).toISOString(),
+          available: false, complete: false, provenance: { target: "<unconfigured>", adapter: "http-health-probe" },
+          data: { endpoint: requirement.endpoint, probeOutcome: "error" },
+          diagnostics: [{ code: "BACKEND_UNCONFIGURED", severity: "info", message: "HTTP health target is not configured for this project." }]
+        };
+      }
       return inspectHealthCheck({
-        baseUrl: config.healthBaseUrl ?? "http://service.example.internal:8080",
+        baseUrl: config.healthBaseUrl,
         requirement,
         timeoutMs: config.timeoutMs,
         maxResponseBytes: config.maxResponseBytes,
@@ -835,6 +899,10 @@ export async function inspectExpectedObservabilityRequirement(
       return inspectTrace({
         requirement,
         backendUrl: config.traceBackendUrl,
+        timeoutMs: config.timeoutMs,
+        maxResponseBytes: config.maxResponseBytes,
+        allowPrivateIps: config.allowPrivateIps,
+        fetchImpl: config.fetchImpl,
         collectedAt: config.collectedAt
       });
 
@@ -928,6 +996,39 @@ async function readBoundedBody(response: Response, maxBytes: number): Promise<{ 
   } finally {
     reader.releaseLock();
   }
+}
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<{ ok: boolean; text: string }> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength && Number.isFinite(Number(contentLength)) && Number(contentLength) > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    return { ok: false, text: "" };
+  }
+  if (!response.body) return { ok: true, text: "" };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) { await reader.cancel("Jaeger response exceeded the configured size limit."); return { ok: false, text: "" }; }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return { ok: false, text: "" };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isRequestMetricRequirement(value: unknown): value is RequestMetricRequirement {

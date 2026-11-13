@@ -94,6 +94,24 @@ function harness(options: {
       calls.sql.push(sql);
       rawCall++;
       if (rawCall === 1) return options.initiallyOwned === false || options.leaseExpiredInitially ? [] : [clone(actualState.remediation)];
+      if (sql.includes("cloudpilot_lock_active_organization")) return options.lockFailure?.includes("organizations")
+        ? [{ locked: false }] : [{ locked: actualState.organizationStatus === "active" }];
+      if (sql.includes("cloudpilot_lock_active_member") || sql.includes("cloudpilot_lock_active_actor_for_update")) {
+        const member = actualState.approverMembership;
+        return [{ role: member?.status === "active" && member.userStatus === "active" &&
+          member.organizationStatus === "active" && actualState.organizationStatus === "active" ? member.role : null }];
+      }
+      if (sql.includes("cloudpilot_lock_scoped_finding")) {
+        const finding = actualState.finding;
+        return [{ locked: !!finding && finding.id === "finding-1" && finding.tenantId === lease.tenantId &&
+          finding.projectId === lease.projectId && finding.scanId === "scan-1" }];
+      }
+      if (sql.includes("cloudpilot_lock_active_binding_installation")) {
+        const binding = actualState.binding;
+        return [{ locked: !options.lockFailure?.includes("project_github_repositories") &&
+          !options.lockFailure?.includes("organization_github_installations") && !!binding &&
+          binding.status === "active" && binding.installation.status === "active" }];
+      }
       if (/FROM remediations/.test(sql)) {
         return options.ownedAtFinalCheck === false || options.leaseExpiredAtFinalCheck || options.leaseReplacedAtFinalCheck
           ? [] : [{ id: lease.id }];
@@ -159,11 +177,16 @@ function persistenceHarness(options: { existing?: boolean; pendingIntent?: boole
         installationRecordId: scope.installationRecordId,
         githubRepositoryId: BigInt(scope.githubRepositoryId), artifactHash: artifact.artifactHash,
         baseRef: "main", baseCommitSha: "b".repeat(40) }];
+      if (sql.includes("cloudpilot_lock_active_organization")) return [{ locked: !options.denyLock?.includes("organizations") }];
+      if (sql.includes("cloudpilot_lock_active_actor_for_update")) return [{ role: "owner" }];
+      if (sql.includes("cloudpilot_lock_active_member")) return [{ role: "admin" }];
+      if (sql.includes("cloudpilot_lock_active_binding_installation")) return [{ locked: !options.denyLock?.includes("project_github_repositories") &&
+        !options.denyLock?.includes("organization_github_installations") }];
       if (sql.includes("FOR SHARE")) return options.denyLock && sql.includes(options.denyLock) ? [] : [{ id: "locked-row" }];
       if (sql.includes("SELECT id,") && sql.includes("FROM remediation_executions") && sql.includes("FOR UPDATE") && !sql.includes("JOIN remediations")) {
         return options.existing ? [execution] : [];
       }
-      if (sql.includes("FROM remediation_executions e JOIN remediations r")) return [execution];
+      if (sql.includes("FROM remediation_executions e")) return [execution];
       if (sql.includes("FROM remediation_executions e") && sql.includes("JOIN organization_members")) return [{ ...execution, actorRole: "owner" }];
       if (sql.includes("lease_expires_at > clock_timestamp() AS valid")) return [{ valid: true }];
       if (sql.includes("SELECT count(*) AS count")) return [{ count: options.pendingIntent ? 1n : 0n }];
@@ -493,29 +516,29 @@ test("approver must retain active organization membership and remediation:approv
 test("Prisma boundary locks and rechecks lease with DB time and Serializable isolation", async () => {
   const h = harness({ leaseExpiredAtFinalCheck: true });
   assert.equal(await h.service.prepare(lease), null, "simulated final lease check fails after validation");
-  assert.equal(h.calls.sql.length, 12);
+  assert.equal(h.calls.sql.length, 11);
   assert.match(h.calls.sql[0], /FOR UPDATE/);
   assert.match(h.calls.sql[0], /lease_expires_at > clock_timestamp\(\)/);
   assert.match(h.calls.sql.at(-1)!, /lease_expires_at > clock_timestamp\(\)/);
-  for (const relation of ["organizations", "projects", "scans", "findings", "project_organization_adoptions",
-    "project_github_repositories", "organization_github_installations", "identity_users", "organization_members"]) {
+  for (const relation of ["projects", "scans", "project_organization_adoptions", "identity_users"]) {
     assert.ok(h.calls.sql.some((sql) => sql.includes(`FROM ${relation}`) && /FOR SHARE/.test(sql)),
       `${relation} is locked through context issuance`);
   }
+  for (const helper of ["cloudpilot_lock_active_organization", "cloudpilot_lock_scoped_finding",
+    "cloudpilot_lock_active_binding_installation", "cloudpilot_lock_active_member"]) {
+    assert.ok(h.calls.sql.some((sql) => sql.includes(helper)), `${helper} performs its lock inside the SECURITY DEFINER boundary`);
+  }
   const lockSql = h.calls.sql.join("\n");
   for (const typedUuidComparison of [
-    /FROM organizations WHERE id =\s*\?\s*::uuid/,
+    /cloudpilot_lock_active_organization\(\s*\?\s*::uuid/,
     /FROM projects WHERE .*organization_id =\s*\?\s*::uuid/,
     /FROM project_organization_adoptions WHERE .*organization_id =\s*\?\s*::uuid/,
-    /FROM project_github_repositories WHERE id =\s*\?\s*::uuid AND .*organization_id =\s*\?\s*::uuid/,
-    /FROM organization_github_installations WHERE .*organization_id =\s*\?\s*::uuid/,
+    /cloudpilot_lock_active_binding_installation\([\s\S]*\?\s*::uuid[\s\S]*\?\s*::uuid/,
     /FROM identity_users WHERE id =\s*\?\s*::uuid/,
-    /FROM organization_members WHERE organization_id =\s*\?\s*::uuid AND user_id =\s*\?\s*::uuid/
+    /cloudpilot_lock_active_member\(\s*\?\s*::uuid\s*,\s*\?\s*::uuid/
   ]) {
     assert.match(lockSql, typedUuidComparison, `UUID database columns use explicit UUID-typed parameters: ${typedUuidComparison}`);
   }
-  assert.match(lockSql, /SELECT organization_id AS id FROM organization_members/,
-    "membership locking selects its composite primary-key column because the table has no id column");
   assert.deepEqual(h.calls.transactionOptions, { isolationLevel: "Serializable" });
   assert.deepEqual(h.calls.identityWhere, { id: { in: ["requester-1", "approver-1"] } });
   assert.deepEqual(h.calls.projectWhere, { id: "project-1", tenantId: "tenant-1", organizationId: "org-1" });

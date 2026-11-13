@@ -7,6 +7,7 @@ import { BoundedScanRunner } from "../../../phase-06/src/jobs/scan-runner.js";
 import { RemediationApiRoutes } from "../../src/api/remediation-api.js";
 import { RemediationApiRepository } from "../../src/api/remediation-api-repo.js";
 import { createCloudPilotHostFromEnvironment } from "../../src/host.js";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 import { buildIdempotencyKey } from "../../../phase-07/src/remediation/planner.js";
 import {
   mintTestJwt,
@@ -15,9 +16,13 @@ import {
   TEST_PUBLIC_KEY
 } from "../../../phase-06/test/jwt-signer.js";
 
-const testUrl = process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const testUrl = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_phase08_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_phase08_test";
 function pointsToDedicatedDatabase(value: string | undefined): boolean {
   if (!value) return false;
+  if (acceptanceDatabase) return value === acceptanceDatabase.url;
   try {
     const url = new URL(value);
     return ["postgres:", "postgresql:"].includes(url.protocol) &&
@@ -47,7 +52,8 @@ const CANONICAL_MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ];
 
 test("Phase 08 remediation API legacy rejection, authorization, tenant scope and read behavior", {
@@ -56,8 +62,8 @@ test("Phase 08 remediation API legacy rejection, authorization, tenant scope and
   const prisma = new PrismaClient({ datasources: { db: { url: testUrl! } } });
   await prisma.$connect();
   const database = await prisma.$queryRaw<Array<{ name: string; user: string }>>`SELECT current_database() AS name, current_user AS user`;
-  assert.equal(database[0]?.name, "cloudpilot_phase08_test");
-  assert.equal(database[0]?.user, "cloudpilot_phase08_test");
+  assert.equal(database[0]?.name, expectedDatabase);
+  assert.equal(database[0]?.user, expectedUsername);
   const migrations = await prisma.$queryRaw<Array<{ migration_name: string; finished_at: Date | null; rolled_back_at: Date | null }>>`
     SELECT migration_name, finished_at, rolled_back_at FROM "_prisma_migrations" ORDER BY migration_name
   `;
@@ -67,14 +73,14 @@ test("Phase 08 remediation API legacy rejection, authorization, tenant scope and
   const tenantIds: string[] = [];
   t.after(async () => {
     const beforeCleanup = await prisma.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
-    assert.equal(beforeCleanup[0]?.name, "cloudpilot_phase08_test", "refuse fixture cleanup outside dedicated database");
+    assert.equal(beforeCleanup[0]?.name, expectedDatabase, "refuse fixture cleanup outside dedicated database");
     for (const tenantId of tenantIds) {
       await prisma.$executeRaw`DELETE FROM tenants WHERE id = ${tenantId}`;
     }
     await prisma.$disconnect();
   });
 
-  await t.test("host rejects worker activation and serves the API with the worker disabled", async () => {
+  await t.test("host composes the approved-artifact worker only after explicit opt-in and serves normally while disabled", async () => {
     assert.equal(await prisma.remediation.count(), 0, "refuse to start the worker when unrelated jobs exist in the test database");
     const jwtConfig = {
       expectedIssuer: TEST_ISSUER,
@@ -82,12 +88,15 @@ test("Phase 08 remediation API legacy rejection, authorization, tenant scope and
       publicKeyOrSecret: TEST_PUBLIC_KEY,
       allowedAlgorithms: ["RS256"]
     };
-    assert.throws(() => createCloudPilotHostFromEnvironment(jwtConfig, {
+    const explicitlyEnabledHost = createCloudPilotHostFromEnvironment(jwtConfig, {
       DATABASE_URL: testUrl,
       NODE_ENV: "test",
       CLOUDPILOT_ENABLE_REMEDIATION_WORKER: "true",
       PORT: "0"
-    }), /cannot be enabled until approved-artifact execution is integrated/);
+    });
+    assert.equal(explicitlyEnabledHost.remediationWorkerEnabled, true);
+    assert.ok(explicitlyEnabledHost.artifactOnlyRemediationWorker);
+    await explicitlyEnabledHost.stop();
     const host = createCloudPilotHostFromEnvironment(jwtConfig, {
       DATABASE_URL: testUrl, NODE_ENV: "test", CLOUDPILOT_ENABLE_REMEDIATION_WORKER: "false", PORT: "0"
     });

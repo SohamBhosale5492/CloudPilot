@@ -22,7 +22,8 @@ import type {
   InspectorEvidence,
   InspectorProvenance,
   InspectorSignal,
-  MetricEvidenceData
+  MetricEvidenceData,
+  TraceEvidenceData
 } from "./inspectors";
 
 export type { EvaluationOutcome };
@@ -53,7 +54,7 @@ export const logGapRule: GapRuleMetadata = {
 
 export const traceGapRule: GapRuleMetadata = {
   id: "CP-RULE-OBS-GAP-TRACE-UNCONFIGURED",
-  version: "1.0.0"
+  version: "1.1.0"
 };
 
 export const alertGapRule: GapRuleMetadata = {
@@ -151,7 +152,7 @@ export function evaluateGap(
     case "log":
       return evaluateUnconfiguredSignalGap(requirement, evidence, logGapRule);
     case "trace":
-      return evaluateUnconfiguredSignalGap(requirement, evidence, traceGapRule);
+      return evaluateTraceGap(requirement, evidence);
     case "alert":
       return evaluateUnconfiguredSignalGap(requirement, evidence, alertGapRule);
     default: {
@@ -476,6 +477,39 @@ function evaluateUnconfiguredSignalGap(
     reason:
       "Unexpected evidence state for an unconfigured backend. Evidence may be fabricated or misrouted."
   };
+}
+
+function evaluateTraceGap(requirement: ExpectedTraceRequirement, evidence: InspectorEvidence): GapFinding {
+  const base = findingBase(traceGapRule, requirement.id, "trace", evidence.provenance);
+  const expected = `Jaeger contains at least one recent trace for service '${requirement.serviceName}'.`;
+  if (!evidence.available) return {
+    ...base, outcome: "unknown", expected,
+    observed: evidence.diagnostics.some((item) => item.code === "BACKEND_UNCONFIGURED")
+      ? "Jaeger trace backend is not configured." : "Jaeger trace evidence is unavailable.",
+    reason: "Missing trace data cannot prove that the application failed to emit traces."
+  };
+  if (!evidence.complete || !isTraceEvidence(evidence.data)) return {
+    ...base, outcome: "inconclusive", expected, observed: "Jaeger returned incomplete or malformed trace evidence.",
+    reason: "Incomplete trace responses cannot support a pass or gap verdict."
+  };
+  if (evidence.data.serviceName !== requirement.serviceName) return {
+    ...base, outcome: "inconclusive", expected,
+    observed: `Jaeger response was correlated to '${evidence.data.serviceName}', not '${requirement.serviceName}'.`,
+    reason: "Service identity mismatch prevents attributing traces to the expected application."
+  };
+  return evidence.data.traceCount > 0 ? {
+    ...base, outcome: "pass", expected, observed: `Jaeger returned ${evidence.data.traceCount} trace(s) for '${requirement.serviceName}'.`,
+    reason: "A complete Jaeger query confirmed recent trace data for the exact expected service name."
+  } : {
+    ...base, outcome: "gap", expected, observed: `Jaeger returned no traces for '${requirement.serviceName}' in the selected lookback window.`,
+    reason: "A complete Jaeger query for the exact service name returned no traces during its lookback window."
+  };
+}
+
+function isTraceEvidence(value: unknown): value is TraceEvidenceData {
+  return typeof value === "object" && value !== null &&
+    typeof (value as TraceEvidenceData).serviceName === "string" &&
+    Number.isInteger((value as TraceEvidenceData).traceCount) && (value as TraceEvidenceData).traceCount >= 0;
 }
 
 // ─── Private helpers ───────────────────────────────────────────────────────────

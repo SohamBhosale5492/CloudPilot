@@ -361,7 +361,9 @@ test("inspectMetric queries Prometheus and returns typed evidence reusing Promet
           {
             metric: {
               __name__: "demo_http_server_requests_total",
-              service_name: "demo-service",
+              exported_job: "demo-service",
+              job: "otel-collector",
+              instance: "otel-collector:8889",
               route: "/api/demo",
               method: "GET",
               status_code: "200"
@@ -415,13 +417,13 @@ test("inspectMetric reports METRIC_UNAVAILABLE when Prometheus is unreachable", 
   assert.equal(evidence.diagnostics[0]?.code, "METRIC_UNAVAILABLE");
 });
 
-test("inspectTrace, inspectLog, and inspectAlert return typed unavailable evidence with BACKEND_UNCONFIGURED", () => {
+test("inspectTrace reports unconfigured evidence while log and alert adapters remain unavailable", async () => {
   const traceReq: ExpectedTraceRequirement = {
     id: "trace-req-1",
     signal: "trace",
     serviceName: "demo-service"
   };
-  const traceEvidence = inspectTrace({ requirement: traceReq });
+  const traceEvidence = await inspectTrace({ requirement: traceReq });
   assert.equal(traceEvidence.signal, "trace");
   assert.equal(traceEvidence.available, false);
   assert.equal(traceEvidence.complete, false);
@@ -452,6 +454,37 @@ test("inspectTrace, inspectLog, and inspectAlert return typed unavailable eviden
   assert.equal(alertEvidence.diagnostics[0]?.code, "BACKEND_UNCONFIGURED");
 });
 
+test("inspectTrace queries Jaeger for the exact service and safely counts matching traces", async () => {
+  const requirement: ExpectedTraceRequirement = { id: "trace-alumni", signal: "trace", serviceName: "secure-alumni-backend" };
+  let requested = "";
+  const evidence = await inspectTrace({
+    requirement, backendUrl: "http://jaeger.example:16686", allowPrivateIps: true,
+    fetchImpl: async (input) => {
+      requested = String(input);
+      return jsonResponse({ data: [
+        { spans: [{ spanID: "1" }], processes: { p1: { serviceName: "secure-alumni-backend" } } },
+        { spans: [{ spanID: "2" }], processes: { p1: { serviceName: "other-service" } } },
+        { spans: [], processes: { p1: { serviceName: "secure-alumni-backend" } } }
+      ] });
+    }
+  });
+  assert.match(requested, /\/api\/traces\?/);
+  assert.match(requested, /service=secure-alumni-backend/);
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.data, { serviceName: "secure-alumni-backend", traceCount: 1 });
+});
+
+test("inspectTrace rejects malformed and oversized Jaeger results without making a positive claim", async () => {
+  const requirement: ExpectedTraceRequirement = { id: "trace-malformed", signal: "trace", serviceName: "api" };
+  const malformed = await inspectTrace({ requirement, backendUrl: "http://jaeger.example:16686", fetchImpl: async () => textResponse("not-json") });
+  assert.equal(malformed.complete, false);
+  assert.equal(malformed.diagnostics[0]?.code, "STATUS_ERROR");
+  const oversized = await inspectTrace({ requirement, backendUrl: "http://jaeger.example:16686", maxResponseBytes: 4, fetchImpl: async () => textResponse('{"data":[]}') });
+  assert.equal(oversized.complete, false);
+  assert.equal(oversized.diagnostics[0]?.code, "RESPONSE_TOO_LARGE");
+});
+
 test("inspectExpectedObservabilityRequirement dispatches correctly across signal families", async () => {
   const healthReq: ExpectedHealthCheckRequirement = {
     id: "health-dispatch",
@@ -470,4 +503,23 @@ test("inspectExpectedObservabilityRequirement dispatches correctly across signal
   assert.equal(evidence.signal, "health");
   assert.equal(evidence.available, true);
   assert.equal(evidence.complete, true);
+});
+
+test("missing Prometheus and health targets return unconfigured evidence without contacting placeholder hosts", async () => {
+  let requests = 0;
+  const fetchImpl: typeof fetch = async () => { requests++; throw new Error("must not fetch"); };
+  const metric = await inspectExpectedObservabilityRequirement({
+    id: "metric-unconfigured", signal: "metric", metricName: "http_requests_total", dimensions: []
+  }, { fetchImpl });
+  const health = await inspectExpectedObservabilityRequirement({
+    id: "health-unconfigured", signal: "health", kind: "http", endpoint: "/health"
+  }, { fetchImpl });
+
+  assert.equal(metric.available, false);
+  assert.equal(metric.provenance.target, "<unconfigured>");
+  assert.equal(metric.diagnostics[0]?.code, "BACKEND_UNCONFIGURED");
+  assert.equal(health.available, false);
+  assert.equal(health.provenance.target, "<unconfigured>");
+  assert.equal(health.diagnostics[0]?.code, "BACKEND_UNCONFIGURED");
+  assert.equal(requests, 0);
 });

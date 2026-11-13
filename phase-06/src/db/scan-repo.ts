@@ -1,4 +1,5 @@
 import { PrismaClient, Scan, Prisma } from "@prisma/client";
+import { randomUUID } from "node:crypto";
 import { PaginatedResult, InvalidCursorError } from "./project-repo.js";
 import { FindingInput } from "./finding-repo.js";
 
@@ -31,6 +32,14 @@ export interface ListScansOptions {
 export interface ReclaimResult {
   requeued: number;
   permanentlyFailed: number;
+}
+
+export interface ScanLease {
+  tenantId: string;
+  projectId: string;
+  scanId: string;
+  workerId: string;
+  leaseToken: string;
 }
 
 export class ActiveScanConflictError extends Error {
@@ -132,13 +141,10 @@ export class ScanRepository {
   }
 
   async updateStatus(tenantId: string, scanId: string, input: UpdateScanStatusInput): Promise<Scan | null> {
-    const existing = await this.findById(tenantId, scanId);
-    if (!existing) {
-      return null;
-    }
-
-    return this.prisma.scan.update({
-      where: { id: scanId },
+    // This compatibility path is used when enqueueing fails, before a worker
+    // owns the pending scan. It must never mutate an active worker's lease.
+    const result = await this.prisma.scan.updateMany({
+      where: { id: scanId, tenantId, status: "pending", leaseToken: null },
       data: {
         status: input.status,
         ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
@@ -150,13 +156,19 @@ export class ScanRepository {
         ...(input.attemptCount !== undefined ? { attemptCount: input.attemptCount } : {})
       }
     });
+    if (result.count === 0) return null;
+    return this.findById(tenantId, scanId);
   }
 
   /**
    * Atomically claims the next pending scan using PostgreSQL FOR UPDATE SKIP LOCKED.
    * Increments attempt_count, assigns workerId, and sets initial lease duration.
    */
-  async claimNextPendingScan(workerId: string, leaseDurationSeconds = 300): Promise<Scan | null> {
+  async claimNextPendingScan(
+    workerId: string,
+    leaseDurationSeconds = 300
+  ): Promise<(Scan & { organizationId: string | null }) | null> {
+    const leaseToken = randomUUID();
     const claimedRows = await this.prisma.$queryRaw<Array<Record<string, unknown>>>`
       WITH claim AS (
         SELECT id
@@ -173,12 +185,14 @@ export class ScanRepository {
           claimed_at = NOW(),
           heartbeat_at = NOW(),
           lease_expires_at = NOW() + (${leaseDurationSeconds} * INTERVAL '1 second'),
+          lease_token = ${leaseToken}::uuid,
           attempt_count = scans.attempt_count + 1
       FROM claim
       WHERE scans.id = claim.id
       RETURNING
         scans.id,
         scans.tenant_id AS "tenantId",
+        scans.organization_id AS "organizationId",
         scans.project_id AS "projectId",
         scans.status,
         scans.triggered_by_id AS "triggeredById",
@@ -186,6 +200,7 @@ export class ScanRepository {
         scans.completed_at AS "completedAt",
         scans.error,
         scans.worker_id AS "workerId",
+        scans.lease_token::text AS "leaseToken",
         scans.claimed_at AS "claimedAt",
         scans.heartbeat_at AS "heartbeatAt",
         scans.lease_expires_at AS "leaseExpiresAt",
@@ -203,6 +218,7 @@ export class ScanRepository {
     return {
       id: row.id as string,
       tenantId: (row.tenantId ?? row.tenant_id) as string,
+      organizationId: ((row.organizationId ?? row.organization_id) as string | null) ?? null,
       projectId: (row.projectId ?? row.project_id) as string,
       status: row.status as string,
       triggeredById: ((row.triggeredById ?? row.triggered_by_id) as string) ?? null,
@@ -210,6 +226,7 @@ export class ScanRepository {
       completedAt: ((row.completedAt ?? row.completed_at) as Date) ?? null,
       error: ((row.error ?? row.error) as string) ?? null,
       workerId: ((row.workerId ?? row.worker_id) as string) ?? null,
+      leaseToken: ((row.leaseToken ?? row.lease_token) as string) ?? null,
       claimedAt: ((row.claimedAt ?? row.claimed_at) as Date) ?? null,
       heartbeatAt: ((row.heartbeatAt ?? row.heartbeat_at) as Date) ?? null,
       leaseExpiresAt: ((row.leaseExpiresAt ?? row.lease_expires_at) as Date) ?? null,
@@ -217,25 +234,56 @@ export class ScanRepository {
       maxAttempts: ((row.maxAttempts ?? row.max_attempts) as number) ?? 3,
       modelOverride: (row.modelOverride ?? row.model_override ?? null) as Prisma.JsonValue,
       createdAt: (row.createdAt ?? row.created_at) as Date
-    };
+    } as Scan & { organizationId: string | null };
   }
 
   /**
-   * Renews the lease conditionally using scan ID, worker ID, and running status.
+   * Renews only the exact, unexpired per-claim lease using database time.
    * Returns false if the worker no longer owns the active lease.
    */
-  async renewLease(tenantId: string, scanId: string, workerId: string, leaseDurationSeconds = 300): Promise<boolean> {
+  async renewLease(lease: ScanLease, leaseDurationSeconds = 300): Promise<boolean> {
     const count = await this.prisma.$executeRaw`
       UPDATE scans
       SET heartbeat_at = NOW(),
           lease_expires_at = NOW() + (${leaseDurationSeconds} * INTERVAL '1 second')
-      WHERE id = ${scanId}
-        AND tenant_id = ${tenantId}
-        AND worker_id = ${workerId}
-        AND status = 'running';
+      WHERE id = ${lease.scanId}
+        AND tenant_id = ${lease.tenantId}
+        AND project_id = ${lease.projectId}
+        AND worker_id = ${lease.workerId}
+        AND lease_token = ${lease.leaseToken}::uuid
+        AND status = 'running'
+        AND lease_expires_at > NOW();
     `;
 
     return count > 0;
+  }
+
+  async recordRunningAudit(lease: ScanLease, actorId: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const count = await tx.$executeRaw`
+        UPDATE scans
+        SET heartbeat_at = NOW()
+        WHERE id = ${lease.scanId}
+          AND tenant_id = ${lease.tenantId}
+          AND project_id = ${lease.projectId}
+          AND worker_id = ${lease.workerId}
+          AND lease_token = ${lease.leaseToken}::uuid
+          AND status = 'running'
+          AND lease_expires_at > NOW();
+      `;
+      if (count === 0) return false;
+      await tx.auditEvent.create({
+        data: {
+          tenantId: lease.tenantId,
+          projectId: lease.projectId,
+          actorId,
+          action: "SCAN_RUNNING",
+          resourceType: "scan",
+          resourceId: lease.scanId
+        }
+      });
+      return true;
+    });
   }
 
   /**
@@ -244,46 +292,51 @@ export class ScanRepository {
    * Throws StaleWorkerError if lease was lost, rolling back findings.
    */
   async completeScanWithFindings(
-    tenantId: string,
-    projectId: string,
-    scanId: string,
-    workerId: string,
-    findings: FindingInput[]
+    lease: ScanLease,
+    findings: FindingInput[],
+    actorId: string
   ): Promise<Scan> {
     return this.prisma.$transaction(async (tx) => {
       // 1. Conditionally update scan to completed, asserting valid active lease
       const updatedCount = await tx.$executeRaw`
         UPDATE scans
         SET status = 'completed',
-            completed_at = NOW()
-        WHERE id = ${scanId}
-          AND tenant_id = ${tenantId}
-          AND worker_id = ${workerId}
+            completed_at = NOW(),
+            worker_id = NULL,
+            lease_token = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            lease_expires_at = NULL
+        WHERE id = ${lease.scanId}
+          AND tenant_id = ${lease.tenantId}
+          AND project_id = ${lease.projectId}
+          AND worker_id = ${lease.workerId}
+          AND lease_token = ${lease.leaseToken}::uuid
           AND status = 'running'
           AND lease_expires_at > NOW();
       `;
 
       if (updatedCount === 0) {
-        throw new StaleWorkerError(scanId, workerId);
+        throw new StaleWorkerError(lease.scanId, lease.workerId);
       }
 
       const scan = await tx.scan.findUniqueOrThrow({
-        where: { id: scanId }
+        where: { id: lease.scanId, tenantId: lease.tenantId, projectId: lease.projectId }
       });
       const attemptNumber = scan.attemptCount;
 
       // 2. Remove any partial findings from prior attempts
       await tx.finding.deleteMany({
-        where: { tenantId, scanId }
+        where: { tenantId: lease.tenantId, scanId: lease.scanId, projectId: lease.projectId }
       });
 
       // 3. Atomically publish findings for the successful attempt
       if (findings.length > 0) {
         await tx.finding.createMany({
           data: findings.map((f) => ({
-            tenantId,
-            projectId,
-            scanId,
+            tenantId: lease.tenantId,
+            projectId: lease.projectId,
+            scanId: lease.scanId,
             attemptNumber,
             requirementId: f.requirementId,
             ruleId: f.ruleId,
@@ -298,6 +351,18 @@ export class ScanRepository {
         });
       }
 
+      await tx.auditEvent.create({
+        data: {
+          tenantId: lease.tenantId,
+          projectId: lease.projectId,
+          actorId,
+          action: "SCAN_COMPLETED",
+          resourceType: "scan",
+          resourceId: lease.scanId,
+          metadataJson: { totalFindings: findings.length } as Prisma.InputJsonValue
+        }
+      });
+
       return scan;
     });
   }
@@ -306,23 +371,43 @@ export class ScanRepository {
    * Conditionally marks a scan as failed if the worker still holds the active lease.
    */
   async failScanWithLease(
-    tenantId: string,
-    scanId: string,
-    workerId: string,
-    errorMessage: string
+    lease: ScanLease,
+    errorMessage: string,
+    actorId: string
   ): Promise<boolean> {
-    const updatedCount = await this.prisma.$executeRaw`
-      UPDATE scans
-      SET status = 'failed',
-          error = ${errorMessage},
-          completed_at = NOW()
-      WHERE id = ${scanId}
-        AND tenant_id = ${tenantId}
-        AND worker_id = ${workerId}
-        AND status = 'running';
-    `;
-
-    return updatedCount > 0;
+    return this.prisma.$transaction(async (tx) => {
+      const updatedCount = await tx.$executeRaw`
+        UPDATE scans
+        SET status = 'failed',
+            error = ${errorMessage},
+            completed_at = NOW(),
+            lease_token = NULL,
+            worker_id = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            lease_expires_at = NULL
+        WHERE id = ${lease.scanId}
+          AND tenant_id = ${lease.tenantId}
+          AND project_id = ${lease.projectId}
+          AND worker_id = ${lease.workerId}
+          AND lease_token = ${lease.leaseToken}::uuid
+          AND status = 'running'
+          AND lease_expires_at > NOW();
+      `;
+      if (updatedCount === 0) return false;
+      await tx.auditEvent.create({
+        data: {
+          tenantId: lease.tenantId,
+          projectId: lease.projectId,
+          actorId,
+          action: "SCAN_FAILED",
+          resourceType: "scan",
+          resourceId: lease.scanId,
+          metadataJson: { error: errorMessage } as Prisma.InputJsonValue
+        }
+      });
+      return true;
+    });
   }
 
   /**
@@ -331,30 +416,68 @@ export class ScanRepository {
    * Jobs with attempt_count >= max_attempts transition to terminal 'failed'.
    */
   async reclaimExpiredLeases(): Promise<ReclaimResult> {
-    const requeuedCount = await this.prisma.$executeRaw`
-      UPDATE scans
-      SET status = 'pending',
-          worker_id = NULL,
-          error = 'Worker lease expired; re-queued for retry.'
-      WHERE status = 'running'
-        AND lease_expires_at < NOW()
-        AND attempt_count < max_attempts;
-    `;
-
-    const permanentlyFailedCount = await this.prisma.$executeRaw`
-      UPDATE scans
-      SET status = 'failed',
-          completed_at = NOW(),
-          error = 'Scan failed: worker lease expired and maximum retry attempts exceeded.'
-      WHERE status = 'running'
-        AND lease_expires_at < NOW()
-        AND attempt_count >= max_attempts;
-    `;
-
-    return {
-      requeued: requeuedCount,
-      permanentlyFailed: permanentlyFailedCount
-    };
+    return this.prisma.$transaction(async (tx) => {
+      const requeued = await tx.$queryRaw<Array<{ id: string }>>`
+        WITH expired AS (
+          SELECT id, tenant_id, project_id, lease_token
+          FROM scans
+          WHERE status = 'running'
+            AND lease_expires_at <= NOW()
+            AND attempt_count < max_attempts
+          ORDER BY lease_expires_at, id
+          FOR UPDATE SKIP LOCKED
+          LIMIT 100
+        )
+        UPDATE scans AS s
+        SET status = 'pending',
+            worker_id = NULL,
+            lease_token = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            lease_expires_at = NULL,
+            error = 'Worker lease expired; re-queued for retry.'
+        FROM expired AS e
+        WHERE s.id = e.id
+          AND s.tenant_id = e.tenant_id
+          AND s.project_id = e.project_id
+          AND s.lease_token IS NOT DISTINCT FROM e.lease_token
+          AND s.status = 'running'
+          AND s.lease_expires_at <= NOW()
+          AND s.attempt_count < s.max_attempts
+        RETURNING s.id;
+      `;
+      const failed = await tx.$queryRaw<Array<{ id: string }>>`
+        WITH expired AS (
+          SELECT id, tenant_id, project_id, lease_token
+          FROM scans
+          WHERE status = 'running'
+            AND lease_expires_at <= NOW()
+            AND attempt_count >= max_attempts
+          ORDER BY lease_expires_at, id
+          FOR UPDATE SKIP LOCKED
+          LIMIT 100
+        )
+        UPDATE scans AS s
+        SET status = 'failed',
+            completed_at = NOW(),
+            worker_id = NULL,
+            lease_token = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            lease_expires_at = NULL,
+            error = 'Scan failed: worker lease expired and maximum retry attempts exceeded.'
+        FROM expired AS e
+        WHERE s.id = e.id
+          AND s.tenant_id = e.tenant_id
+          AND s.project_id = e.project_id
+          AND s.lease_token IS NOT DISTINCT FROM e.lease_token
+          AND s.status = 'running'
+          AND s.lease_expires_at <= NOW()
+          AND s.attempt_count >= s.max_attempts
+        RETURNING s.id;
+      `;
+      return { requeued: requeued.length, permanentlyFailed: failed.length };
+    });
   }
 
   /**

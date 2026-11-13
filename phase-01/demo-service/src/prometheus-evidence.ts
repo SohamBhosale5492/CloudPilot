@@ -26,12 +26,11 @@ type PrometheusApiResult =
 
 type CoverageResult = "complete" | "incomplete" | "unavailable";
 
-const PROMETHEUS_SERVICE_LABEL = "service_name";
+const PROMETHEUS_SERVICE_LABEL = "exported_job";
 const PROMETHEUS_ROUTE_LABEL = "route";
 const PROMETHEUS_METHOD_LABEL = "method";
 const PROMETHEUS_STATUS_LABEL = "status_code";
 const PROMETHEUS_SCRAPE_JOB = "otel-collector";
-const PROMETHEUS_SCRAPE_INSTANCE = "otel-collector:8889";
 const DEFAULT_SCRAPE_STEP_SECONDS = 5;
 const PROMETHEUS_METRIC_NAME_PATTERN = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const SUPPORTED_RESULT_LABELS = new Set([
@@ -39,6 +38,8 @@ const SUPPORTED_RESULT_LABELS = new Set([
   PROMETHEUS_ROUTE_LABEL,
   PROMETHEUS_METHOD_LABEL,
   PROMETHEUS_STATUS_LABEL,
+  "job",
+  "instance",
   "__name__"
 ]);
 
@@ -107,6 +108,7 @@ export function buildPrometheusRequestMetricQuery(requirement: RequestMetricRequ
 
   const matchers = [
     `${PROMETHEUS_SERVICE_LABEL}="${escapePrometheusLabelValue(requirement.serviceName)}"`,
+    `job="${PROMETHEUS_SCRAPE_JOB}"`,
     `${PROMETHEUS_ROUTE_LABEL}="${escapePrometheusLabelValue(requirement.route)}"`
   ];
 
@@ -114,7 +116,7 @@ export function buildPrometheusRequestMetricQuery(requirement: RequestMetricRequ
     matchers.push(`${PROMETHEUS_METHOD_LABEL}="${escapePrometheusLabelValue(requirement.method)}"`);
   }
 
-  return `sum by (${PROMETHEUS_SERVICE_LABEL},${PROMETHEUS_ROUTE_LABEL},${PROMETHEUS_METHOD_LABEL},${PROMETHEUS_STATUS_LABEL}) ` +
+  return `sum by (${PROMETHEUS_SERVICE_LABEL},${PROMETHEUS_ROUTE_LABEL},${PROMETHEUS_METHOD_LABEL},${PROMETHEUS_STATUS_LABEL},job,instance) ` +
     `(increase(${requirement.metricName}{${matchers.join(",")}}[${collectionWindowSeconds}s]))`;
 }
 
@@ -182,7 +184,7 @@ function buildPrometheusCoverageUrl(options: PrometheusEvidenceOptions, queryTim
   const url = buildPrometheusApiUrl(options.baseUrl, "/api/v1/query_range");
   const endSeconds = queryTime.getTime() / 1000;
   const startSeconds = endSeconds - options.collectionWindowSeconds;
-  const upSelector = `up{job="${PROMETHEUS_SCRAPE_JOB}",instance="${PROMETHEUS_SCRAPE_INSTANCE}"}`;
+  const upSelector = `up{job="${PROMETHEUS_SCRAPE_JOB}"}`;
   const query = `timestamp(${upSelector} == 1)`;
 
   url.searchParams.set("query", query);
@@ -252,7 +254,7 @@ function hasCompleteCoverageSeries(series: unknown, startSeconds: number, endSec
 
   if (
     series.metric.job !== PROMETHEUS_SCRAPE_JOB ||
-    series.metric.instance !== PROMETHEUS_SCRAPE_INSTANCE
+    !isNonEmptyString(series.metric.instance)
   ) {
     return false;
   }
@@ -365,14 +367,18 @@ function normalizePrometheusResult(result: unknown, requirement: RequestMetricRe
     return undefined;
   }
 
-  if (typeof metric.__name__ === "string" && metric.__name__ !== requirement.metricName) {
+  // Prometheus aggregation drops the special __name__ label. The query's
+  // selector still pins the requested metric; validate the label when present.
+  if (metric.__name__ !== undefined && metric.__name__ !== requirement.metricName) {
     return undefined;
   }
 
   if (
     metric[PROMETHEUS_SERVICE_LABEL] !== requirement.serviceName ||
     metric[PROMETHEUS_ROUTE_LABEL] !== requirement.route ||
-    (requirement.method !== undefined && metric[PROMETHEUS_METHOD_LABEL] !== requirement.method)
+    (requirement.method !== undefined && metric[PROMETHEUS_METHOD_LABEL] !== requirement.method) ||
+    metric.job !== PROMETHEUS_SCRAPE_JOB ||
+    !isNonEmptyString(metric.instance)
   ) {
     return undefined;
   }
@@ -390,7 +396,8 @@ function normalizePrometheusResult(result: unknown, requirement: RequestMetricRe
   if (
     !isNonEmptyString(metric[PROMETHEUS_SERVICE_LABEL]) ||
     !isNonEmptyString(metric[PROMETHEUS_ROUTE_LABEL]) ||
-    !isNonEmptyString(metric[PROMETHEUS_METHOD_LABEL])
+    !isNonEmptyString(metric[PROMETHEUS_METHOD_LABEL]) ||
+    (PROMETHEUS_STATUS_LABEL in metric && !isNonEmptyString(metric[PROMETHEUS_STATUS_LABEL]))
   ) {
     return undefined;
   }

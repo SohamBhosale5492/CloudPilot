@@ -3,11 +3,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { PrismaClient } from "@prisma/client";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 import type { AuthenticatedIdentity } from "../../../phase-06/src/auth/jwt-verifier.js";
 import type { AuthenticatedRouteContext } from "../../../phase-06/src/api/server.js";
 import { ArchitectureApiRoutes, PrismaArchitectureProjectStore } from "../../src/api/architecture-api.js";
 
-const testUrl = process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const testUrl = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_phase08_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_phase08_test";
 const migrationNames = [
   "20261014000000_init", "20261023000000_durable_jobs", "20261023100000_remediation",
   "20261023110000_remediation_composite_fk", "20261030100000_remediation_worker_leases",
@@ -17,11 +21,16 @@ const migrationNames = [
   "20261105160000_remediation_execution_artifact", "20261106120000_remediation_execution_persistence",
   "20261107130000_system_recovery_lease", "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ];
 
 function validateTestUrl(value: string | undefined): asserts value is string {
   if (!value) throw new Error("CLOUDPILOT_PHASE08_TEST_DATABASE_URL is required.");
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return;
+  }
   const url = new URL(value);
   if (!["postgres:", "postgresql:"].includes(url.protocol) ||
       !["127.0.0.1", "localhost", "::1"].includes(url.hostname) ||
@@ -49,8 +58,8 @@ test("expected-model merge persists atomically with audit and enforces stale-wri
   const prisma = new PrismaClient({ datasources: { db: { url: testUrl } } });
   await prisma.$connect();
   const identity = await prisma.$queryRaw<Array<{ name: string; user: string }>>`SELECT current_database() AS name, current_user AS user`;
-  assert.equal(identity[0]?.name, "cloudpilot_phase08_test");
-  assert.equal(identity[0]?.user, "cloudpilot_phase08_test");
+  assert.equal(identity[0]?.name, expectedDatabase);
+  assert.equal(identity[0]?.user, expectedUsername);
   const migrations = await prisma.$queryRaw<Array<{ migration_name: string; checksum: string; finished_at: Date | null; rolled_back_at: Date | null }>>`
     SELECT migration_name, checksum, finished_at, rolled_back_at FROM "_prisma_migrations" ORDER BY migration_name
   `;
@@ -71,7 +80,7 @@ test("expected-model merge persists atomically with audit and enforces stale-wri
   await prisma.project.create({ data: { id: projectId, tenantId, name: `merge-fixture-${projectId}`, expectedModel: baseModel } });
   t.after(async () => {
     const beforeCleanup = await prisma.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
-    assert.equal(beforeCleanup[0]?.name, "cloudpilot_phase08_test");
+    assert.equal(beforeCleanup[0]?.name, expectedDatabase);
     await prisma.tenant.deleteMany({ where: { id: tenantId } });
     await prisma.$disconnect();
   });

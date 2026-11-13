@@ -87,3 +87,23 @@ test("proposal API surfaces stale plan/binding conflicts as 409", async () => {
   assert.equal(request.response.status, 409);
   assert.deepEqual(request.response.body, { error: "The proposal changed.", approvalState: "invalidated" });
 });
+
+test("artifact preparation route accepts persisted proposal identity only and requires create permission", async () => {
+  const store = new ProposalStore();
+  const prepared: unknown[] = [];
+  const preparation = { async prepare(input: unknown) { prepared.push(input); return { artifactHash: "b".repeat(64), replayed: false }; } };
+  const identities = { async resolve() { return { id: "local-user" }; } };
+  const routes = new RemediationProposalApiRoutes(identities as never, store, { expectedIssuer: issuer }, preparation as never);
+  const proposalId = "77777777-7777-4777-8777-777777777777";
+  const request = context("POST", `/api/v1/remediation-proposals/${proposalId}/prepare-artifact`, identity("operator"), {});
+  assert.equal(await routes.handle(request.value), true);
+  assert.equal(request.response.status, 200);
+  assert.deepEqual(request.response.body, { artifactHash: "b".repeat(64), replayed: false });
+  assert.deepEqual(prepared, [{ tenantId: "verified-tenant", remediationId: proposalId,
+    identity: { issuer, subject: "verified-subject" } }]);
+
+  const viewer = context("POST", `/api/v1/remediation-proposals/${proposalId}/prepare-artifact`, identity("viewer"), {});
+  assert.equal(await routes.handle(viewer.value), true);
+  assert.equal(viewer.response.status, 403);
+  assert.equal(prepared.length, 1);
+});

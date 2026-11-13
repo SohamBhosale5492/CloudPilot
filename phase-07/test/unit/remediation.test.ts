@@ -276,6 +276,49 @@ test("GitHubConnector: findOpenPullRequest returns matching PR", async () => {
   assert.equal(result!.url, "https://github.com/o/r/pull/42");
 });
 
+test("GitHubConnector: finds all PR states and identifies merged PRs", async () => {
+  for (const scenario of [
+    { state: "open", merged_at: null, expected: "open" },
+    { state: "closed", merged_at: "2026-10-30T10:00:00Z", expected: "merged" },
+    { state: "closed", merged_at: null, expected: "closed" }
+  ]) {
+    let requestUrl = "";
+    const response = [{
+      number: 42,
+      html_url: "https://github.com/o/r/pull/42",
+      title: "Fix it",
+      state: scenario.state,
+      merged_at: scenario.merged_at,
+      head: { ref: "my-branch" },
+      base: { ref: "main" }
+    }];
+    const gh = new GitHubConnector({
+      token: "t",
+      fetchImpl: async (input, init) => {
+        requestUrl = String(input);
+        return makeFetch(200, response)(input, init);
+      }
+    });
+    const result = await gh.findPullRequestByHead("o", "r", "my-branch", "main");
+    assert.equal(result?.state, scenario.expected);
+    assert.match(requestUrl, /state=all/);
+  }
+});
+
+test("GitHubConnector: preserves Retry-After metadata for HTTP 429", async () => {
+  const gh = new GitHubConnector({
+    token: "t",
+    fetchImpl: async () => new Response(JSON.stringify({ message: "rate limited" }), {
+      status: 429,
+      headers: { "Content-Type": "application/json", "Retry-After": "7" }
+    })
+  });
+  await assert.rejects(
+    () => gh.findPullRequestByHead("o", "r", "branch", "main"),
+    (error: unknown) => error instanceof GitHubApiError && error.retryAfter === "7"
+  );
+});
+
 // ─── 2. RemediationPlanner ──────────────────────────────────────────────────
 
 test("planRemediation: metric gap produces correct filePath and prTitle", () => {
@@ -382,10 +425,14 @@ function makeConnectorStub(overrides: Partial<{
   updateFile: (...args: any[]) => Promise<string>;
   createPullRequest: (...args: any[]) => Promise<unknown>;
   findOpenPullRequest: (...args: any[]) => Promise<unknown>;
+  findPullRequestByHead: (...args: any[]) => Promise<unknown>;
 }> = {}): GitHubConnector {
   const sha40 = "a".repeat(40);
   return {
-    getBranchSha: overrides.getBranchSha ?? (async () => ({ name: "main", sha: sha40 })),
+    getBranchSha: overrides.getBranchSha ?? (async (_owner: string, _repo: string, branch: string) => {
+      if (branch !== "main") throw new GitHubNotFoundError("branch not found", "{}");
+      return { name: branch, sha: sha40 };
+    }),
     createBranch: overrides.createBranch ?? (async () => {}),
     getFileContent: overrides.getFileContent ?? (async () => ({
       path: "config/observability/metrics.yaml",
@@ -402,7 +449,8 @@ function makeConnectorStub(overrides: Partial<{
       headBranch: "cloudpilot/remediate/something",
       baseBranch: "main"
     })),
-    findOpenPullRequest: overrides.findOpenPullRequest ?? (async () => null)
+    findOpenPullRequest: overrides.findOpenPullRequest ?? (async () => null),
+    findPullRequestByHead: overrides.findPullRequestByHead ?? overrides.findOpenPullRequest ?? (async () => null)
   } as unknown as GitHubConnector;
 }
 
@@ -465,9 +513,17 @@ test("RemediationOrchestrator: happy path creates branch and PR", async () => {
 test("RemediationOrchestrator: branch conflict (422) is non-fatal — continues", async () => {
   const prisma = makePrisma();
   let prCreated = false;
+  let branchExists = false;
 
   const gh = makeConnectorStub({
-    createBranch: async () => { throw new GitHubConflictError("branch exists", "{}"); },
+    getBranchSha: async (_owner: string, _repo: string, branch: string) => {
+      if (branch === "main" || branchExists) return { name: branch, sha: "a".repeat(40) };
+      throw new GitHubNotFoundError("branch not found", "{}");
+    },
+    createBranch: async () => {
+      branchExists = true;
+      throw new GitHubConflictError("branch exists", "{}");
+    },
     createPullRequest: async () => {
       prCreated = true;
       return { number: 8, url: "https://github.com/o/r/pull/8", title: "T", state: "open", headBranch: "b", baseBranch: "main" };
@@ -525,6 +581,58 @@ test("RemediationOrchestrator: existing open PR → idempotent, no duplicate PR"
   assert.equal(result.status, "open");
   assert.equal(result.prNumber, 55);
   assert.equal(prCreated, false, "Should NOT create a duplicate PR");
+});
+
+test("RemediationOrchestrator: historical merged PR is marked complete without creating another PR", async () => {
+  const remediations = new Map<string, unknown>();
+  const prisma = makePrisma(remediations);
+  let prCreated = false;
+  const gh = makeConnectorStub({
+    findPullRequestByHead: async () => ({
+      number: 56,
+      url: "https://github.com/o/r/pull/56",
+      title: "merged remediation",
+      state: "merged",
+      headBranch: "cloudpilot/remediate/hash",
+      baseBranch: "main"
+    }),
+    createPullRequest: async () => { prCreated = true; return {}; }
+  });
+  const orch = new RemediationOrchestrator(prisma as never, gh, { owner: "o", repo: "r" });
+  const result = await orch.remediateOne("t1", "p1", "s1", "f1", makeGapFinding());
+
+  assert.equal(result.status, "merged");
+  assert.equal(result.skipped, true);
+  assert.equal(prCreated, false);
+  const row = remediations.get(`key:${buildIdempotencyKey("t1", "f1", "rule.metric.present", "1.0.0")}`) as { status: string };
+  assert.equal(row.status, "merged");
+});
+
+test("RemediationOrchestrator: closed PR remains closed for manual review without retrying", async () => {
+  const remediations = new Map<string, unknown>();
+  const prisma = makePrisma(remediations);
+  let prCreated = false;
+  const gh = makeConnectorStub({
+    findPullRequestByHead: async () => ({
+      number: 57,
+      url: "https://github.com/o/r/pull/57",
+      title: "closed remediation",
+      state: "closed",
+      headBranch: "cloudpilot/remediate/hash",
+      baseBranch: "main"
+    }),
+    createPullRequest: async () => { prCreated = true; return {}; }
+  });
+  const orch = new RemediationOrchestrator(prisma as never, gh, { owner: "o", repo: "r" });
+  const result = await orch.remediateOne("t1", "p1", "s1", "f1", makeGapFinding());
+
+  assert.equal(result.status, "closed");
+  assert.equal(result.skipped, true);
+  assert.match(result.skipReason ?? "", /manual review/i);
+  assert.equal(prCreated, false);
+  const row = remediations.get(`key:${buildIdempotencyKey("t1", "f1", "rule.metric.present", "1.0.0")}`) as { status: string; retriesLeft: number };
+  assert.equal(row.status, "closed");
+  assert.equal(row.retriesLeft, 3);
 });
 
 test("RemediationOrchestrator: DB idempotency – existing open record returns without GitHub calls", async () => {

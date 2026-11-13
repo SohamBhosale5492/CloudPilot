@@ -24,7 +24,8 @@ const expectedMigrations = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ];
 const canonicalSchemaPath = path.join(root, "phase-08", "prisma", "schema.prisma");
 const canonicalMigrationPath = path.join(root, "phase-08", "prisma", "migrations");
@@ -286,7 +287,59 @@ const rateLimitRetryMigration = await readFile(path.join(canonicalMigrationPath,
   "20261109120000_remediation_execution_retry", "migration.sql"), "utf8");
 const mutationResourceTypeMigration = await readFile(path.join(canonicalMigrationPath,
   "20261110120000_allow_mutation_rejection_resource_type", "migration.sql"), "utf8");
+const runtimeLockHelpersMigration = await readFile(path.join(canonicalMigrationPath,
+  "20261111120000_runtime_lock_helpers", "migration.sql"), "utf8");
 const executionPersistenceSource = await readFile(path.join(root, "phase-08", "src", "remediation", "remediation-execution-persistence.ts"), "utf8");
+const runtimeGrantScript = await readFile(path.join(root, "phase-08", "scripts", "grant-runtime-role.sql"), "utf8");
+const trustedClaimContextSource = await readFile(path.join(root, "phase-08", "src", "remediation", "trusted-claim-execution-context.ts"), "utf8");
+const runtimeLockHelpersSource = await readFile(path.join(root, "phase-08", "src", "remediation", "postgres-lock-helpers.ts"), "utf8");
+const runtimeLockFunctions = [
+  { name: "cloudpilot_lock_active_organization", signature: "(p_organization_id uuid)", aclSignature: "uuid", returns: "boolean" },
+  { name: "cloudpilot_lock_active_member", signature: "(p_organization_id uuid, p_user_id uuid)", aclSignature: "uuid, uuid", returns: "text" },
+  { name: "cloudpilot_lock_active_actor_for_update", signature: "(p_organization_id uuid, p_user_id uuid)", aclSignature: "uuid, uuid", returns: "text" },
+  { name: "cloudpilot_lock_scoped_finding", signature: "(p_tenant_id text, p_project_id text, p_scan_id text, p_finding_id text)", aclSignature: "text, text, text, text", returns: "boolean" },
+  { name: "cloudpilot_lock_active_binding_installation", signature: "(p_tenant_id text, p_organization_id uuid, p_project_id text, p_binding_id uuid, p_installation_id uuid, p_github_repository_id bigint)", aclSignature: "text, uuid, text, uuid, uuid, bigint", returns: "boolean" }
+];
+for (const helper of runtimeLockFunctions) {
+  const name = helper.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const createSignature = helper.signature.slice(1, -1).split(",")
+    .map((part) => part.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s*,\\s*");
+  assert.match(runtimeLockHelpersMigration,
+    new RegExp(`CREATE FUNCTION public\\.${name}\\s*\\(\\s*${createSignature}\\s*\\)\\s+RETURNS ${helper.returns}[\\s\\S]*?LANGUAGE plpgsql\\s+SECURITY DEFINER\\s+SET search_path = pg_catalog`, "i"),
+    `${helper.name} must use the reviewed signature and hardened SECURITY DEFINER settings`);
+  assert.match(runtimeLockHelpersMigration,
+    new RegExp(`REVOKE ALL ON FUNCTION public\\.${name}\\s*\\(${helper.aclSignature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\) FROM PUBLIC;`, "i"),
+    `${helper.name} must revoke PUBLIC execution`);
+}
+assert.match(runtimeLockHelpersMigration, /FOR UPDATE OF o, m, u/i,
+  "the reconciliation actor helper must preserve exclusive authorization-row locks");
+assert.match(runtimeLockHelpersMigration, /FOR SHARE OF b, i/i,
+  "binding and installation must retain one atomic SHARE lock operation");
+assert.match(runtimeLockHelpersMigration, /FOR SHARE OF f/i,
+  "finding validation must retain its scoped SHARE lock");
+assert.doesNotMatch(runtimeLockHelpersMigration, /EXECUTE\s+format|\bEXECUTE\s+['"]|CREATE\s+(?:TABLE|SEQUENCE)/i,
+  "lock helpers must not use dynamic SQL or create unrelated objects");
+assert.match(runtimeGrantScript, /GRANT SELECT ON TABLE[\s\S]*remediation_execution_events[\s\S]*TO cloudpilot_runtime/i);
+assert.match(runtimeGrantScript,
+  /REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public\.remediation_execution_events,[\s\S]*public\.audit_events,[\s\S]*public\.organization_audit_events FROM cloudpilot_runtime/i);
+assert.match(runtimeGrantScript, /GRANT EXECUTE ON FUNCTION public\.cloudpilot_lock_active_binding_installation[\s\S]*TO cloudpilot_runtime/i);
+assert.match(runtimeGrantScript, /REVOKE ALL ON SCHEMA public FROM cloudpilot_runtime/i);
+assert.match(runtimeGrantScript, /GRANT USAGE ON SCHEMA public TO cloudpilot_runtime/i);
+assert.doesNotMatch(runtimeGrantScript, /GRANT\s+[^;]*\b(tenants|users|github_webhook_deliveries)\b/i,
+  "runtime grants must exclude tenants, users, and GitHub webhook deliveries");
+assert.match(runtimeGrantScript, /REVOKE DELETE, TRUNCATE ON TABLE/i);
+assert.match(runtimeGrantScript, /REVOKE ALL PRIVILEGES ON TABLE public\._prisma_migrations FROM cloudpilot_runtime/i,
+  "runtime must not retain privileges on Prisma migration metadata");
+assert.match(runtimeGrantScript, /has_table_privilege\('cloudpilot_runtime', 'public\._prisma_migrations', 'SELECT'\)/i,
+  "runtime migration metadata access must be checked as an effective privilege");
+assert.match(runtimeLockHelpersSource, /cloudpilot_lock_active_binding_installation/);
+assert.match(trustedClaimContextSource, /lockScopedFinding\(/);
+assert.match(executionPersistenceSource, /lockActiveActorForUpdate\(/);
+assert.doesNotMatch(trustedClaimContextSource,
+  /SELECT id FROM organizations WHERE[\s\S]{0,180}FOR SHARE|SELECT id FROM findings WHERE[\s\S]{0,240}FOR SHARE|SELECT id FROM organization_github_installations WHERE[\s\S]{0,240}FOR SHARE|SELECT organization_id AS id FROM organization_members WHERE[\s\S]{0,180}FOR SHARE/i,
+  "trusted claim code must not directly lock tables without runtime UPDATE privileges");
+assert.doesNotMatch(executionPersistenceSource, /FOR UPDATE OF e,\s*(?:o,\s*m,\s*u|m,\s*u,\s*o)/i,
+  "execution persistence must route protected authorization-row locks through the helper");
 for (const required of [
   'CREATE TABLE "remediation_executions"',
   'CREATE TABLE "remediation_execution_events"',
@@ -504,6 +557,8 @@ for (const phase of phases) {
 
   if (phase === "phase-08") {
     assert.equal(manifest.prisma?.schema, "prisma/schema.prisma");
+    assert.match(await readFile(canonicalSchemaPath, "utf8"), /url\s*=\s*env\("DATABASE_URL"\)[\s\S]*directUrl\s*=\s*env\("MIGRATION_DATABASE_URL"\)/,
+      "Prisma runtime and migration URLs must be explicitly separated");
     assert.match(manifest.scripts?.["prisma:generate"] ?? "", /--schema prisma\/schema\.prisma/);
     assert.match(manifest.scripts?.["prisma:migrate"] ?? "", /migrate deploy --schema prisma\/schema\.prisma/);
   } else {

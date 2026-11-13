@@ -20,6 +20,7 @@ docker compose -f phase-01/docker-compose.yml up -d --build
 | `http://localhost:9090` | Prometheus UI |
 | `http://localhost:16686` | Jaeger UI |
 | `http://localhost:4318` | Collector OTLP HTTP receiver |
+| `http://127.0.0.1:13133/` | Collector health-check extension (loopback only) |
 
 The Collector's Prometheus exporter is internal-only at `otel-collector:8889`; Prometheus scrapes it inside the Compose network.
 
@@ -62,3 +63,34 @@ No persistent volumes are required for this demo.
 - If traces are missing, generate more `/api/demo` traffic and check that the Collector and Jaeger containers are running.
 - If Docker cannot pull images or npm packages during build, retry with network access available.
 - If a host port is already in use, stop the conflicting local service or temporarily edit the published port in `docker-compose.yml`.
+
+## End-to-end observability gap demonstration
+
+This workflow uses the Phase 01 workload and telemetry stack, the existing Phase 02–05 analysis modules, and the Phase 07 deterministic remediation planner. It is local-only. Generated YAML is printed for review and is not written into the workload or sent to GitHub.
+
+From the repository root, with Docker Compose available:
+
+```powershell
+docker compose -f phase-01/docker-compose.yml up -d --build
+node phase-01/scripts/verify.mjs --already-running
+Start-Sleep -Seconds 65
+npm --prefix phase-07 run demo:observability
+```
+
+The `--already-running` option prevents the verification script from invoking Docker; it checks health, generates request traffic, and verifies Prometheus/Jaeger data against the stack started by the first command. It also checks the Collector health endpoint from the host. The additional wait allows the demo's 60-second scrape-coverage window to fill. The observability command then discovers the Compose services, reads Prometheus and Collector configuration, probes health, and evaluates the checked-in expected model against live Prometheus evidence.
+
+Expected result when the stack is healthy and scrape coverage is complete:
+
+- `demo-request-count`: pass, based on the demo service's request counter.
+- `demo-queue-depth`: confirmed gap, because the expected metric is absent despite complete Prometheus scrape evidence.
+- `demo-health`: pass.
+- Logs, traces, and alert evaluation: unknown because Phase 04 does not yet include those backend inspectors; missing backend evidence is not labeled a confirmed gap.
+- A parsed and validated proposed `config/observability/metrics.yaml` entry for the missing queue-depth requirement. Review it manually; the command does not persist or apply it.
+
+Stop the local stack when finished:
+
+```powershell
+docker compose -f phase-01/docker-compose.yml down
+```
+
+Live verification was completed on 2026-11-10 against the already-running Phase 01 stack: demo and Collector health, Prometheus request metric, and Jaeger trace passed; the Phase 07 workflow confirmed complete Prometheus coverage, request-metric and health `PASS`, missing queue-depth `GAP`, and logs/traces/alerts `UNKNOWN`. Generated YAML validated, and hashes confirmed the workload files were unchanged. The deterministic mocked end-to-end workflow is also covered by the Phase 07 `observability-demo` unit test.

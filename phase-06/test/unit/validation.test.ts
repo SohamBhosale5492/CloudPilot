@@ -1,6 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateProjectCreatePayload, sanitizeErrorDetails } from "../../src/api/validation.js";
+import { validateProjectCreatePayload, validateProjectTargetConfig, sanitizeErrorDetails } from "../../src/api/validation.js";
+
+test("telemetry target validation accepts HTTP Prometheus, health, and Jaeger targets with typed metric rules", () => {
+  const result = validateProjectTargetConfig({
+    prometheusBaseUrl: "http://127.0.0.1:9090",
+    healthBaseUrl: "http://localhost:3000",
+    traceBackendUrl: "http://jaeger:16686",
+    metricConfigs: { requests: { serviceName: "demo-service", route: "/api/demo", method: "GET", minimumCount: 1, maxEvidenceAgeMs: 60_000 } }
+  });
+  assert.equal(result.valid, true);
+  assert.equal(result.data?.metricConfigs?.requests?.minimumCount, 1);
+  assert.equal(result.data?.traceBackendUrl, "http://jaeger:16686/");
+});
+
+test("telemetry target validation rejects malformed URLs, credentials, unsupported adapters, and invalid metric rules", () => {
+  for (const input of [
+    { prometheusBaseUrl: "not a URL" },
+    { healthBaseUrl: "ftp://localhost/health" },
+    { prometheusBaseUrl: "http://user:secret@localhost:9090" },
+    { traceBackendUrl: "ftp://localhost:16686" },
+    { metricConfigs: { requests: { serviceName: "", route: "api", minimumCount: -1, maxEvidenceAgeMs: 0 } } }
+  ]) assert.equal(validateProjectTargetConfig(input).valid, false);
+});
 
 test("validateProjectCreatePayload: valid project payload", () => {
   const result = validateProjectCreatePayload({

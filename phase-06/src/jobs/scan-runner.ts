@@ -1,11 +1,12 @@
 import os from "node:os";
 import crypto from "node:crypto";
 import { PrismaClient, Scan } from "@prisma/client";
-import { ScanRepository, ActiveScanConflictError, StaleWorkerError } from "../db/scan-repo.js";
+import { ScanRepository, ActiveScanConflictError, StaleWorkerError, type ScanLease } from "../db/scan-repo.js";
 import { FindingRepository, FindingInput } from "../db/finding-repo.js";
 import { ProjectRepository } from "../db/project-repo.js";
 import { AuditRepository } from "../db/audit-repo.js";
 import { sanitizeErrorDetails } from "../api/validation.js";
+import { validateAndSanitizeUrl } from "../../../phase-01/demo-service/src/inspectors.js";
 import {
   evaluateExpectedObservabilityModel,
   GapEngineConfig,
@@ -17,6 +18,7 @@ import {
   InspectorEvidence
 } from "../../../phase-01/demo-service/src/inspectors.js";
 import type { ExpectedObservabilityModel } from "../../../phase-01/demo-service/src/expected-observability.js";
+import { expectedModelDigest } from "../../../phase-01/demo-service/src/source-observability-analysis.js";
 
 export { ActiveScanConflictError, StaleWorkerError };
 
@@ -254,26 +256,54 @@ export class BoundedScanRunner {
   async executeClaimedScan(scan: Scan, fetchImpl?: typeof fetch): Promise<void> {
     const { tenantId, projectId, id: scanId, triggeredById } = scan;
     const actorId = triggeredById ?? "system";
+    const leaseToken = scan.leaseToken;
+    const lease: ScanLease = {
+      tenantId,
+      projectId,
+      scanId,
+      workerId: scan.workerId ?? this.workerId,
+      leaseToken: typeof leaseToken === "string" ? leaseToken : ""
+    };
+    if (!lease.leaseToken) {
+      console.warn(`[BoundedScanRunner] Scan ${scanId} has no claim token; refusing execution.`);
+      return;
+    }
 
-    // Start background heartbeat lease renewal ticker
+    // A heartbeat error is treated as ownership loss (fail closed). DB writes
+    // remain independently fenced, so abort support is only a resource saving.
     const heartbeatKey = `${tenantId}:${scanId}`;
+    const abortController = new AbortController();
+    let ownershipLost = false;
+    let heartbeatInFlight: Promise<void> | null = null;
+    const loseOwnership = (): void => {
+      ownershipLost = true;
+      abortController.abort();
+    };
+    const assertOwnership = (): void => {
+      if (ownershipLost) throw new StaleWorkerError(scanId, lease.workerId);
+    };
     const heartbeatTimer = setInterval(() => {
-      this.scanRepo.renewLease(tenantId, scanId, this.workerId, this.leaseDurationSeconds).catch(() => {});
+      if (ownershipLost || heartbeatInFlight) return;
+      heartbeatInFlight = this.scanRepo.renewLease(lease, this.leaseDurationSeconds)
+        .then((renewed) => { if (!renewed) loseOwnership(); })
+        .catch(loseOwnership)
+        .finally(() => { heartbeatInFlight = null; });
     }, this.heartbeatIntervalMs);
     this.activeHeartbeats.set(heartbeatKey, heartbeatTimer);
+    const stopHeartbeats = async (): Promise<void> => {
+      clearInterval(heartbeatTimer);
+      if (heartbeatInFlight) await heartbeatInFlight;
+    };
 
     try {
-      await this.auditRepo.record({
-        tenantId,
-        actorId,
-        action: "SCAN_RUNNING",
-        resourceType: "scan",
-        resourceId: scanId,
-        projectId
-      });
+      if (!await this.scanRepo.recordRunningAudit(lease, actorId)) {
+        loseOwnership();
+        throw new StaleWorkerError(scanId, lease.workerId);
+      }
 
       // Fetch project
       const project = await this.projectRepo.findById(tenantId, projectId);
+      assertOwnership();
       if (!project) {
         throw new Error(`Project ${projectId} not found.`);
       }
@@ -282,36 +312,36 @@ export class BoundedScanRunner {
       const model = ((scan.modelOverride ?? project.expectedModel) as ExpectedObservabilityModel | null);
 
       if (!model || !Array.isArray(model.requirements) || model.requirements.length === 0) {
-        // No requirements: complete scan with 0 findings atomically
-        await this.scanRepo.completeScanWithFindings(tenantId, projectId, scanId, this.workerId, []);
-
-        await this.auditRepo.record({
-          tenantId,
-          actorId,
-          action: "SCAN_COMPLETED",
-          resourceType: "scan",
-          resourceId: scanId,
-          projectId,
-          metadata: { totalFindings: 0 }
-        });
-        return;
+        throw new Error("Scan cannot evaluate this project because its expected observability model has no requirements.");
       }
 
       // Resolve target configuration
       const targetConfig = (project.targetConfig ?? {}) as Record<string, unknown>;
+      const sourceAnalysis = isRecord(targetConfig.sourceAnalysis) ? targetConfig.sourceAnalysis : undefined;
+      const sourceEvidenceActive = sourceAnalysis?.modelDigest === expectedModelDigest(model);
+      const sourceEvidenceByRequirement = sourceEvidenceActive && isRecord(sourceAnalysis?.evidenceByRequirement)
+        ? sourceAnalysis.evidenceByRequirement : {};
+      const effectiveMetricConfigs = {
+        ...(sourceEvidenceActive && isRecord(sourceAnalysis?.metricConfigs) ? sourceAnalysis.metricConfigs : {}),
+        ...(isRecord(targetConfig.metricConfigs) ? targetConfig.metricConfigs : {})
+      };
+      const telemetryFetch = fetchImpl ?? this.defaultFetchImpl ?? fetch;
       const inspectorConfig: InspectorConfiguration = {
         prometheusBaseUrl: typeof targetConfig.prometheusBaseUrl === "string" ? targetConfig.prometheusBaseUrl : undefined,
         healthBaseUrl: typeof targetConfig.healthBaseUrl === "string" ? targetConfig.healthBaseUrl : undefined,
         traceBackendUrl: typeof targetConfig.traceBackendUrl === "string" ? targetConfig.traceBackendUrl : undefined,
-        logBackendUrl: typeof targetConfig.logBackendUrl === "string" ? targetConfig.logBackendUrl : undefined,
-        alertBackendUrl: typeof targetConfig.alertBackendUrl === "string" ? targetConfig.alertBackendUrl : undefined,
-        fetchImpl: fetchImpl ?? this.defaultFetchImpl,
+        metricConfigs: effectiveMetricConfigs as InspectorConfiguration["metricConfigs"],
+        fetchImpl: (input, init) => telemetryFetch(input, {
+          ...init,
+          signal: init?.signal ? AbortSignal.any([init.signal, abortController.signal]) : abortController.signal
+        }),
         allowPrivateIps: true
       };
 
       // Gather evidence for requirements
       const evidences: InspectorEvidence[] = [];
       for (const requirement of model.requirements) {
+        assertOwnership();
         try {
           const ev = await inspectExpectedObservabilityRequirement(requirement, inspectorConfig);
           evidences.push(ev);
@@ -323,7 +353,7 @@ export class BoundedScanRunner {
             available: false,
             complete: false,
             provenance: {
-              target: inspectorConfig.healthBaseUrl ?? inspectorConfig.prometheusBaseUrl ?? "unknown",
+              target: safeTargetUrl(inspectorConfig.healthBaseUrl ?? inspectorConfig.prometheusBaseUrl),
               adapter: "error-capture"
             },
             diagnostics: [
@@ -336,15 +366,17 @@ export class BoundedScanRunner {
           });
         }
       }
+      assertOwnership();
 
       // Pure deterministic Gap Engine evaluation
       const gapEngineConfig: GapEngineConfig = {
-        metricConfigs: targetConfig.metricConfigs as GapEngineConfig["metricConfigs"],
+        metricConfigs: effectiveMetricConfigs as GapEngineConfig["metricConfigs"],
         maxHealthEvidenceAgeMs: 60000,
         evaluatedAt: new Date()
       };
 
       const findings = evaluateExpectedObservabilityModel(model, evidences, gapEngineConfig);
+      const evidenceByRequirement = new Map(evidences.map((evidence) => [evidence.requirementId, evidence]));
 
       const findingInputs: FindingInput[] = findings.map((f: GapFinding) => ({
         requirementId: f.requirementId,
@@ -356,48 +388,73 @@ export class BoundedScanRunner {
         observed: f.observed,
         reason: f.reason,
         evidenceJson: {
-          provenance: f.evidenceProvenance
+          provenance: f.evidenceProvenance,
+          evidence: evidenceByRequirement.get(f.requirementId) ?? null,
+          sourceEvidence: sourceEvidenceByRequirement[f.requirementId] ?? null,
+          sourceModelDigest: sourceEvidenceActive ? sourceAnalysis?.modelDigest : null
         }
       }));
 
-      // Atomic completion & findings publication (fails if worker lost its lease)
-      await this.scanRepo.completeScanWithFindings(tenantId, projectId, scanId, this.workerId, findingInputs);
+      if (sourceEvidenceActive && Array.isArray(sourceAnalysis?.findings)) {
+        for (const candidate of sourceAnalysis.findings) {
+          if (!isRecord(candidate) || typeof candidate.id !== "string" || typeof candidate.ruleId !== "string" ||
+              typeof candidate.title !== "string" || typeof candidate.expected !== "string" || typeof candidate.observed !== "string" ||
+              typeof candidate.risk !== "string" || !["low", "medium", "high"].includes(String(candidate.severity)) ||
+              !["gap", "incomplete"].includes(String(candidate.status)) || !Array.isArray(candidate.evidence)) continue;
+          const sourceEvidence = candidate.evidence.filter((item): item is Record<string, unknown> => isRecord(item) &&
+            typeof item.path === "string" && typeof item.line === "number" && Number.isInteger(item.line) && typeof item.claim === "string");
+          findingInputs.push({
+            requirementId: `source:${candidate.id}`,
+            ruleId: candidate.ruleId,
+            ruleVersion: "1.0.0",
+            signal: candidate.ruleId.includes("HEALTH") ? "health" : candidate.ruleId.includes("TRACING") ? "trace" : "metric",
+            outcome: candidate.status === "gap" ? "gap" : "unknown",
+            expected: candidate.expected,
+            observed: candidate.observed,
+            reason: `Source-level assessment only; this result does not assert a runtime failure. ${candidate.risk}`,
+            evidenceJson: {
+              provenance: { target: "uploaded-source-snapshot", adapter: "deterministic-node-express-source-rules" },
+              sourceAssessment: { kind: "source_configuration", severity: candidate.severity, status: candidate.status, risk: candidate.risk },
+              sourceEvidence,
+              sourceDigest: sourceAnalysis.sourceDigest
+            }
+          });
+        }
+      }
 
-      await this.auditRepo.record({
-        tenantId,
-        actorId,
-        action: "SCAN_COMPLETED",
-        resourceType: "scan",
-        resourceId: scanId,
-        projectId,
-        metadata: { totalFindings: findings.length }
-      });
+      // Atomic completion & findings publication (fails if worker lost its lease)
+      await stopHeartbeats();
+      assertOwnership();
+      await this.scanRepo.completeScanWithFindings(lease, findingInputs, actorId);
     } catch (err) {
-      if (err instanceof StaleWorkerError) {
-        console.warn(`[BoundedScanRunner] Stale worker publication aborted: ${err.message}`);
+      await stopHeartbeats();
+      if (err instanceof StaleWorkerError || ownershipLost) {
+        console.warn(`[BoundedScanRunner] Stale worker publication aborted for scan ${scanId}.`);
         return;
       }
 
       const sanitized = sanitizeErrorDetails(err);
       try {
-        await this.scanRepo.failScanWithLease(tenantId, scanId, this.workerId, sanitized);
+        // Failure state and its terminal audit are committed together, and
+        // only when this exact token still owns an unexpired lease.
+        await this.scanRepo.failScanWithLease(lease, sanitized, actorId);
       } catch {
         // Ignore if lease already lost
       }
-
-      await this.auditRepo.record({
-        tenantId,
-        actorId,
-        action: "SCAN_FAILED",
-        resourceType: "scan",
-        resourceId: scanId,
-        projectId,
-        metadata: { error: sanitized }
-      });
     } finally {
       // Clear heartbeat ticker
       clearInterval(heartbeatTimer);
       this.activeHeartbeats.delete(heartbeatKey);
     }
   }
+}
+
+function safeTargetUrl(value: string | undefined): string {
+  if (!value) return "unknown";
+  const validated = validateAndSanitizeUrl(value, { allowPrivateIps: true });
+  return validated.sanitizedUrl ?? "<invalid-target>";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

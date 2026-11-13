@@ -9,13 +9,21 @@ import {
   isTrustedClaimExecutionContext,
   TrustedClaimExecutionContextService
 } from "../../src/remediation/trusted-claim-execution-context.js";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 
-const DATABASE_URL = process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const DATABASE_URL = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_claim_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_claim_test";
 if (!DATABASE_URL) {
   throw new Error("CLOUDPILOT_CLAIM_TEST_DATABASE_URL is required for trusted execution context integration tests.");
 }
 
 function parseApprovedUrl(value: string): URL {
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return new URL(acceptanceDatabase.url);
+  }
   let url: URL;
   try {
     url = new URL(value);
@@ -279,8 +287,8 @@ test("PostgreSQL trusted claim execution context validates persisted approval, s
       SELECT current_database() AS database, current_user AS username,
         inet_server_addr()::text AS "serverAddress", inet_server_port() AS "serverPort"
     `;
-    assert.equal(identity[0]?.database, "cloudpilot_claim_test", "refuse any database other than the disposable claim database");
-    assert.equal(identity[0]?.username, "cloudpilot_claim_test", "refuse an unexpected database user");
+    assert.equal(identity[0]?.database, expectedDatabase, "refuse any database other than the approved disposable database");
+    assert.equal(identity[0]?.username, expectedUsername, "refuse an unexpected database user");
     assert.equal(Number(identity[0]?.serverPort), 5432, "verify PostgreSQL's container-side port");
     assert.ok(isPrivateServerAddress(identity[0]?.serverAddress ?? null), "refuse an unexpected PostgreSQL server address");
 
@@ -414,10 +422,20 @@ test("PostgreSQL trusted claim execution context validates persisted approval, s
           transactionBoundClient(tx, (sql) => observedQueries.push(sql))
         ).prepare(finalCheckFixture.lease);
         assert.ok(finalCheckContext, "valid context should survive the transactional final lease check");
-        for (const relation of ["organizations", "projects", "scans", "findings", "project_organization_adoptions",
-          "project_github_repositories", "organization_github_installations", "identity_users", "organization_members"]) {
-          assert.ok(observedQueries.some((sql) => sql.includes(`FROM ${relation}`) && /FOR SHARE/i.test(sql)),
-            `the real preparation transaction must lock ${relation} authorization state`);
+        const authorizationLockEvidence: Array<[string, (sql: string) => boolean]> = [
+          ["organizations", (sql) => sql.includes("cloudpilot_lock_active_organization")],
+          ["projects", (sql) => sql.includes("FROM projects") && /FOR SHARE/i.test(sql)],
+          ["scans", (sql) => sql.includes("FROM scans") && /FOR SHARE/i.test(sql)],
+          ["findings", (sql) => sql.includes("cloudpilot_lock_scoped_finding")],
+          ["project_organization_adoptions", (sql) => sql.includes("FROM project_organization_adoptions") && /FOR SHARE/i.test(sql)],
+          ["project_github_repositories", (sql) => sql.includes("cloudpilot_lock_active_binding_installation")],
+          ["organization_github_installations", (sql) => sql.includes("cloudpilot_lock_active_binding_installation")],
+          ["identity_users", (sql) => sql.includes("FROM identity_users") && /FOR SHARE/i.test(sql)],
+          ["organization_members", (sql) => sql.includes("cloudpilot_lock_active_member")]
+        ];
+        for (const [relation, matchesLock] of authorizationLockEvidence) {
+          assert.ok(observedQueries.some(matchesLock),
+            `the real preparation transaction must lock ${relation} authorization state directly or through its scoped helper`);
         }
         assert.equal(observedQueries.filter((sql) => sql.includes("FROM remediations") &&
           sql.includes("lease_expires_at > clock_timestamp()") && /FOR UPDATE/i.test(sql)).length, 2,

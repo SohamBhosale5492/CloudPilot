@@ -8,6 +8,7 @@ import { PrismaOrganizationAuthorizationService } from "../../src/organizations/
 import { PrismaProjectAdoptionService } from "../../src/organizations/project-adoption-service.js";
 import {
   GitHubRepositoryBindingUnavailableError,
+  PrismaGitHubRepositoryBindingResolver,
   PrismaTrustedOrganizationGitHubAuthorizationService
 } from "../../src/github/organization-authorization-contract.js";
 import { hasOrganizationPermission } from "../../src/organizations/permissions.js";
@@ -17,6 +18,25 @@ const otherOrg = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const projectId = "22222222-2222-4222-8222-222222222222";
 const tenant = "verified-entra-tenant";
 const user = "33333333-3333-4333-8333-333333333333";
+
+test("persisted GitHub binding resolver scopes active repository and installation to the same project organization", async () => {
+  const queries: unknown[] = [];
+  let active = true;
+  const tx = { projectGitHubRepository: { async findFirst(args: unknown) {
+    queries.push(args);
+    return active ? { githubRepositoryId: 9007199254740993n, installation: { githubInstallationId: 9007199254740995n } } : null;
+  } } } as never;
+  const resolver = new PrismaGitHubRepositoryBindingResolver();
+  assert.deepEqual(await resolver.findActiveBinding(tx, { tenantId: tenant, organizationId: org, projectId }), {
+    repositoryId: "9007199254740993", installationId: "9007199254740995"
+  });
+  assert.deepEqual(queries[0], { where: {
+    organizationId: org, tenantId: tenant, projectId, status: "active",
+    installation: { is: { organizationId: org, status: "active" } }
+  }, select: { githubRepositoryId: true, installation: { select: { githubInstallationId: true } } } });
+  active = false;
+  assert.equal(await resolver.findActiveBinding(tx, { tenantId: tenant, organizationId: org, projectId }), null);
+});
 
 test("integration status permission is available to all active org roles while management stays owner/admin only", () => {
   for (const role of ["owner", "admin", "operator", "viewer"]) {

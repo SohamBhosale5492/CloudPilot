@@ -27,8 +27,12 @@ export interface FindingSummary {
 }
 
 export interface RemediationPatch {
+  /** Versioned deterministic planner identity used by persisted execution artifacts. */
+  plannerVersion: "phase07-planner-v1";
   /** Repository-relative file path to modify. */
   filePath: string;
+  /** Canonical initial file content used only when the trusted snapshot says the file is absent. */
+  initialFileContent: string;
   /** Human-readable title for the PR. */
   prTitle: string;
   /** Markdown body explaining the gap and the change. */
@@ -174,7 +178,14 @@ function buildMetricPatch(finding: FindingSummary): RemediationPatch {
   const metricName = finding.requirementId.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
 
   return {
+    plannerVersion: "phase07-planner-v1",
     filePath,
+    initialFileContent: [
+      "# CloudPilot Observability — Metrics Configuration",
+      "# cloudpilot:metrics",
+      "metrics: []",
+      ""
+    ].join("\n"),
     prTitle: `fix(observability): add missing metric '${metricName}'`,
     prBody: [
       `## CloudPilot Remediation`,
@@ -221,7 +232,14 @@ function buildHealthPatch(finding: FindingSummary): RemediationPatch {
   const svcName = finding.requirementId.replace(/[^a-zA-Z0-9_\-]/g, "-").toLowerCase();
 
   return {
+    plannerVersion: "phase07-planner-v1",
     filePath,
+    initialFileContent: [
+      "# CloudPilot Observability — Health Checks",
+      "# cloudpilot:health-checks",
+      "health_checks: []",
+      ""
+    ].join("\n"),
     prTitle: `fix(observability): add missing health check for '${svcName}'`,
     prBody: [
       `## CloudPilot Remediation`,
@@ -268,7 +286,14 @@ function buildAlertPatch(finding: FindingSummary): RemediationPatch {
   const alertName = finding.requirementId.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
 
   return {
+    plannerVersion: "phase07-planner-v1",
     filePath,
+    initialFileContent: [
+      "# CloudPilot Observability — Alert Rules",
+      "# cloudpilot:alerts",
+      "alerts: []",
+      ""
+    ].join("\n"),
     prTitle: `fix(observability): add missing alert rule '${alertName}'`,
     prBody: [
       `## CloudPilot Remediation`,

@@ -1,21 +1,16 @@
 /**
  * Phase 06 PostgreSQL Integration Tests
  *
- * Requires PostgreSQL at DATABASE_URL. Start it with:
- *   docker compose -f phase-06/docker-compose.yml up -d
- *
- * Then apply migrations:
- *   npx --prefix phase-06 prisma migrate deploy
- *
- * If the database is unavailable the entire suite is SKIPPED (not failed).
- * This allows the unit test suite to run independently in CI without Docker.
- * Integration tests are always required before committing.
+ * Requires CLOUDPILOT_FIXTURE_TEST_DATABASE_URL for the isolated
+ * cloudpilot_runtime_role_test database and fixture-only role on loopback port 56440. The suite verifies current_database() before any
+ * cleanup and refuses to run when a dedicated database is not configured.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { CloudPilotApiServer } from "../../src/api/server.js";
-import { checkDatabaseConnection, disconnectPrisma } from "../../src/db/client.js";
+import { checkDatabaseConnection } from "../../src/db/client.js";
 import { ScanRepository, StaleWorkerError } from "../../src/db/scan-repo.js";
 import {
   mintTestJwt,
@@ -23,51 +18,52 @@ import {
   TEST_ISSUER,
   TEST_AUDIENCE
 } from "../jwt-signer.js";
+import { cleanupTestOwnedFixtures, requireDedicatedPhase06TestDatabase } from "./safety.js";
 
-const DATABASE_URL = process.env.DATABASE_URL ?? "postgresql://cloudpilot:cloudpilot_password@localhost:5432/cloudpilot_test";
+const DATABASE_URL = requireDedicatedPhase06TestDatabase(process.env.CLOUDPILOT_FIXTURE_TEST_DATABASE_URL);
 
 async function runIntegrationSuite() {
   const prisma = new PrismaClient({ datasources: { db: { url: DATABASE_URL } } });
 
-  // Pre-flight: is PostgreSQL reachable?
-  const dbHealth = await checkDatabaseConnection(prisma);
-  if (!dbHealth.ok) {
-    console.warn(
-      `\n[INTEGRATION TESTS SKIPPED] PostgreSQL is unavailable at ${DATABASE_URL}.\n` +
-      `Start it with: docker compose -f phase-06/docker-compose.yml up -d\n` +
-      `Then apply migrations: npx --prefix phase-06 prisma migrate deploy\n` +
-      `Error: ${dbHealth.error}\n`
-    );
+  // Verify the actual server-side database identity before any fixture cleanup.
+  try {
+    const identity = await prisma.$queryRaw<Array<{ database_name: string; database_user: string; server_port: number }>>`
+      SELECT current_database() AS database_name, current_user AS database_user, inet_server_port() AS server_port
+    `;
+    if (identity.length !== 1 || identity[0].database_name !== "cloudpilot_runtime_role_test" ||
+        identity[0].database_user !== "cloudpilot_integration_test" || identity[0].server_port !== 5432) {
+      throw new Error("Connected database identity is not the approved Phase 06 disposable test database; refusing cleanup.");
+    }
+    const dbHealth = await checkDatabaseConnection(prisma);
+    if (!dbHealth.ok) throw new Error("Dedicated Phase 06 test database is unavailable; refusing to run integration tests.");
+  } catch (error) {
     await prisma.$disconnect();
-    return;
+    throw error;
   }
 
-  // Cleanup: wipe all test data in dependency order
-  async function cleanDb() {
-    await prisma.auditEvent.deleteMany({});
-    await prisma.finding.deleteMany({});
-    await prisma.scan.deleteMany({});
-    await prisma.project.deleteMany({});
-    await prisma.user.deleteMany({});
-    await prisma.tenant.deleteMany({});
-  }
-
-  await cleanDb();
+  const runId = randomUUID();
+  const tenantIds: string[] = [];
+  const alphaAdminId = `it-${runId}-alpha-admin`;
+  const alphaOperatorId = `it-${runId}-alpha-operator`;
+  const alphaViewerId = `it-${runId}-alpha-viewer`;
+  const betaAdminId = `it-${runId}-beta-admin`;
 
   // Seed tenants and users
-  const tenantAlpha = await prisma.tenant.create({ data: { id: "it-tenant-alpha", name: "Alpha Corp" } });
-  const tenantBeta = await prisma.tenant.create({ data: { id: "it-tenant-beta", name: "Beta Corp" } });
+  const tenantAlpha = await prisma.tenant.create({ data: { id: `it-${runId}-tenant-alpha`, name: `Alpha Corp ${runId}` } });
+  tenantIds.push(tenantAlpha.id);
+  const tenantBeta = await prisma.tenant.create({ data: { id: `it-${runId}-tenant-beta`, name: `Beta Corp ${runId}` } });
+  tenantIds.push(tenantBeta.id);
 
-  await prisma.user.create({ data: { id: "it-u-alpha-admin", tenantId: tenantAlpha.id, email: "alpha-admin@test.com", role: "admin" } });
-  await prisma.user.create({ data: { id: "it-u-alpha-op", tenantId: tenantAlpha.id, email: "alpha-op@test.com", role: "operator" } });
-  await prisma.user.create({ data: { id: "it-u-alpha-viewer", tenantId: tenantAlpha.id, email: "alpha-viewer@test.com", role: "viewer" } });
-  await prisma.user.create({ data: { id: "it-u-beta-admin", tenantId: tenantBeta.id, email: "beta-admin@test.com", role: "admin" } });
+  await prisma.user.create({ data: { id: alphaAdminId, tenantId: tenantAlpha.id, email: `${alphaAdminId}@test.invalid`, role: "admin" } });
+  await prisma.user.create({ data: { id: alphaOperatorId, tenantId: tenantAlpha.id, email: `${alphaOperatorId}@test.invalid`, role: "operator" } });
+  await prisma.user.create({ data: { id: alphaViewerId, tenantId: tenantAlpha.id, email: `${alphaViewerId}@test.invalid`, role: "viewer" } });
+  await prisma.user.create({ data: { id: betaAdminId, tenantId: tenantBeta.id, email: `${betaAdminId}@test.invalid`, role: "admin" } });
 
   // Mint tokens (RS256 only — verifies production-default config)
-  const tokenAlphaAdmin = mintTestJwt({ sub: "it-u-alpha-admin", tenantId: tenantAlpha.id, roles: ["admin"] });
-  const tokenAlphaOp = mintTestJwt({ sub: "it-u-alpha-op", tenantId: tenantAlpha.id, roles: ["operator"] });
-  const tokenAlphaViewer = mintTestJwt({ sub: "it-u-alpha-viewer", tenantId: tenantAlpha.id, roles: ["viewer"] });
-  const tokenBetaAdmin = mintTestJwt({ sub: "it-u-beta-admin", tenantId: tenantBeta.id, roles: ["admin"] });
+  const tokenAlphaAdmin = mintTestJwt({ sub: alphaAdminId, tenantId: tenantAlpha.id, roles: ["admin"] });
+  const tokenAlphaOp = mintTestJwt({ sub: alphaOperatorId, tenantId: tenantAlpha.id, roles: ["operator"] });
+  const tokenAlphaViewer = mintTestJwt({ sub: alphaViewerId, tenantId: tenantAlpha.id, roles: ["viewer"] });
+  const tokenBetaAdmin = mintTestJwt({ sub: betaAdminId, tenantId: tenantBeta.id, roles: ["admin"] });
 
   // Start API server with RS256-only JWT config (production default)
   const server = new CloudPilotApiServer({
@@ -106,7 +102,7 @@ async function runIntegrationSuite() {
     });
 
     await test("IT: expired token is rejected with 401", async () => {
-      const expired = mintTestJwt({ sub: "it-u-alpha-admin", tenantId: tenantAlpha.id, roles: ["admin"], expSecondsFromNow: -300 });
+      const expired = mintTestJwt({ sub: alphaAdminId, tenantId: tenantAlpha.id, roles: ["admin"], expSecondsFromNow: -300 });
       const res = await fetch(`${baseUrl}/api/v1/projects`, {
         headers: { Authorization: `Bearer ${expired}` }
       });
@@ -391,13 +387,13 @@ async function runIntegrationSuite() {
       const sharedTimestamp = new Date("2026-01-01T12:00:00Z");
       // Create 3 projects with identical createdAt
       const pA = await prisma.project.create({
-        data: { id: "proj-tie-a", tenantId: tenantAlpha.id, name: "tie-project-a", createdAt: sharedTimestamp }
+        data: { id: `proj-${runId}-tie-a`, tenantId: tenantAlpha.id, name: `tie-project-a-${runId}`, createdAt: sharedTimestamp }
       });
       const pB = await prisma.project.create({
-        data: { id: "proj-tie-b", tenantId: tenantAlpha.id, name: "tie-project-b", createdAt: sharedTimestamp }
+        data: { id: `proj-${runId}-tie-b`, tenantId: tenantAlpha.id, name: `tie-project-b-${runId}`, createdAt: sharedTimestamp }
       });
       const pC = await prisma.project.create({
-        data: { id: "proj-tie-c", tenantId: tenantAlpha.id, name: "tie-project-c", createdAt: sharedTimestamp }
+        data: { id: `proj-${runId}-tie-c`, tenantId: tenantAlpha.id, name: `tie-project-c-${runId}`, createdAt: sharedTimestamp }
       });
 
       // Page 1
@@ -574,6 +570,13 @@ async function runIntegrationSuite() {
 
     // ────── 12. Durable Job Coordination, Leases & Multi-Worker Concurrency ──────
     const scanRepo = new ScanRepository(prisma);
+    // The API's background poller is not under test in this repository-level
+    // claim suite. Stop it and isolate pending rows to this test-owned tenant.
+    await (server as unknown as { scanRunner: { shutdown(): Promise<void> } }).scanRunner.shutdown();
+    await prisma.scan.updateMany({
+      where: { tenantId: tenantAlpha.id, status: "pending" },
+      data: { status: "failed", error: "Isolated before scan lease repository tests." }
+    });
 
     await test("IT: two or more workers racing to claim one scan using FOR UPDATE SKIP LOCKED", async () => {
       const raceProj = await prisma.project.create({
@@ -598,6 +601,7 @@ async function runIntegrationSuite() {
       assert.equal(winner?.id, pendingScan.id);
       assert.equal(winner?.status, "running");
       assert.ok(winner?.workerId === "worker-node-1" || winner?.workerId === "worker-node-2");
+      assert.match(winner?.leaseToken ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     });
 
     await test("IT: concurrent scans for different projects run independently", async () => {
@@ -639,7 +643,12 @@ async function runIntegrationSuite() {
       assert.ok(recovered);
       assert.equal(recovered.status, "pending", "Expired lease should be re-queued to pending");
       assert.equal(recovered.workerId, null, "Worker ID must be cleared for re-queuing");
+      assert.equal(recovered.leaseToken, null, "Expired lease token must be cleared during recovery");
       assert.match(recovered.error ?? "", /re-queued/i);
+      await prisma.scan.updateMany({
+        where: { id: crashedScan.id, tenantId: tenantAlpha.id, status: "pending", leaseToken: null },
+        data: { status: "failed", error: "Recovery fixture consumed by its test." }
+      });
     });
 
     await test("IT: retry exhaustion and terminal failure", async () => {
@@ -675,6 +684,7 @@ async function runIntegrationSuite() {
           projectId: healthyProj.id,
           status: "running",
           workerId: "alive-worker-1",
+          leaseToken: randomUUID(),
           startedAt: new Date(),
           heartbeatAt: new Date(),
           leaseExpiresAt: new Date(Date.now() + 60000), // 60s in future
@@ -684,7 +694,13 @@ async function runIntegrationSuite() {
       });
 
       // Renew lease explicitly
-      const renewed = await scanRepo.renewLease(tenantAlpha.id, activeScan.id, "alive-worker-1", 120);
+      const renewed = await scanRepo.renewLease({
+        tenantId: tenantAlpha.id,
+        projectId: healthyProj.id,
+        scanId: activeScan.id,
+        workerId: "alive-worker-1",
+        leaseToken: activeScan.leaseToken!
+      }, 120);
       assert.equal(renewed, true);
 
       // Run reaper
@@ -733,6 +749,7 @@ async function runIntegrationSuite() {
           projectId: staleProj.id,
           status: "running",
           workerId: "stale-worker-lost-lease",
+          leaseToken: randomUUID(),
           startedAt: new Date(),
           leaseExpiresAt: new Date(Date.now() - 10000), // Expired lease
           attemptCount: 1,
@@ -743,7 +760,13 @@ async function runIntegrationSuite() {
       // Attempting to publish findings should throw StaleWorkerError
       await assert.rejects(
         async () => {
-          await scanRepo.completeScanWithFindings(tenantAlpha.id, staleProj.id, staleScan.id, "stale-worker-lost-lease", [
+          await scanRepo.completeScanWithFindings({
+            tenantId: tenantAlpha.id,
+            projectId: staleProj.id,
+            scanId: staleScan.id,
+            workerId: "stale-worker-lost-lease",
+            leaseToken: staleScan.leaseToken!
+          }, [
             {
               requirementId: "req-stale",
               ruleId: "rule-1",
@@ -755,7 +778,7 @@ async function runIntegrationSuite() {
               reason: "stale publication",
               evidenceJson: {}
             }
-          ]);
+          ], alphaAdminId);
         },
         (err: unknown) => {
           assert.ok(err instanceof StaleWorkerError);
@@ -767,6 +790,10 @@ async function runIntegrationSuite() {
       // Verify no findings were persisted
       const findings = await prisma.finding.findMany({ where: { scanId: staleScan.id } });
       assert.equal(findings.length, 0, "No findings must be published by a stale worker");
+      await prisma.scan.updateMany({
+        where: { id: staleScan.id, tenantId: tenantAlpha.id, status: "running" },
+        data: { status: "failed", leaseToken: null, workerId: null, leaseExpiresAt: null }
+      });
     });
 
     await test("IT: no duplicated or cross-tenant findings after retries", async () => {
@@ -777,6 +804,7 @@ async function runIntegrationSuite() {
           projectId: retryProj.id,
           status: "running",
           workerId: "valid-retry-worker",
+          leaseToken: randomUUID(),
           startedAt: new Date(),
           leaseExpiresAt: new Date(Date.now() + 60000),
           attemptCount: 2,
@@ -804,7 +832,13 @@ async function runIntegrationSuite() {
       });
 
       // Attempt 2 succeeds and publishes findings atomically
-      await scanRepo.completeScanWithFindings(tenantAlpha.id, retryProj.id, retryScan.id, "valid-retry-worker", [
+      await scanRepo.completeScanWithFindings({
+        tenantId: tenantAlpha.id,
+        projectId: retryProj.id,
+        scanId: retryScan.id,
+        workerId: "valid-retry-worker",
+        leaseToken: retryScan.leaseToken!
+      }, [
         {
           requirementId: "req-1",
           ruleId: "r-1",
@@ -816,7 +850,7 @@ async function runIntegrationSuite() {
           reason: "attempt 2 succeeded",
           evidenceJson: {}
         }
-      ]);
+      ], alphaAdminId);
 
       const finalFindings = await prisma.finding.findMany({ where: { scanId: retryScan.id } });
       assert.equal(finalFindings.length, 1, "Findings from attempt 1 must be purged; exactly 1 final finding");
@@ -824,9 +858,86 @@ async function runIntegrationSuite() {
       assert.equal(finalFindings[0].attemptNumber, 2);
     });
 
+    await test("IT: same worker ID receives fresh fencing token after expiry; stale attempt cannot mutate or audit", async () => {
+      const project = await prisma.project.create({ data: { tenantId: tenantAlpha.id, name: "same-worker-token-fence" } });
+      const pending = await scanRepo.create({ tenantId: tenantAlpha.id, projectId: project.id });
+      const tokenAClaim = await scanRepo.claimNextPendingScan("reused-worker-id", 60);
+      assert.ok(tokenAClaim);
+      assert.equal(tokenAClaim.id, pending.id);
+      const tokenA = tokenAClaim.leaseToken!;
+      const leaseA = {
+        tenantId: tenantAlpha.id,
+        projectId: project.id,
+        scanId: pending.id,
+        workerId: "reused-worker-id",
+        leaseToken: tokenA
+      };
+
+      await prisma.scan.update({
+        where: { id: pending.id },
+        data: { leaseExpiresAt: new Date(Date.now() - 5000) }
+      });
+      assert.equal(await scanRepo.renewLease(leaseA), false, "expired token cannot be renewed even before reaping");
+      assert.deepEqual(await scanRepo.reclaimExpiredLeases(), { requeued: 1, permanentlyFailed: 0 });
+
+      const tokenBClaim = await scanRepo.claimNextPendingScan("reused-worker-id", 60);
+      assert.ok(tokenBClaim);
+      assert.equal(tokenBClaim.id, pending.id);
+      assert.equal(tokenBClaim.workerId, tokenAClaim.workerId);
+      const tokenB = tokenBClaim.leaseToken!;
+      assert.match(tokenB, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      assert.notEqual(tokenB, tokenA);
+
+      const leaseB = { ...leaseA, leaseToken: tokenB };
+      assert.equal(await scanRepo.renewLease(leaseA), false, "old claim cannot heartbeat after same worker ID reclaims");
+
+      const staleFinding = {
+        requirementId: "stale-token-finding",
+        ruleId: "rule-stale",
+        ruleVersion: "1",
+        signal: "metric",
+        outcome: "gap",
+        expected: "present",
+        observed: "missing",
+        reason: "stale token must not publish",
+        evidenceJson: {}
+      };
+      await assert.rejects(scanRepo.completeScanWithFindings(leaseA, [staleFinding], alphaAdminId), StaleWorkerError);
+      assert.equal(await scanRepo.failScanWithLease(leaseA, "stale failure", alphaAdminId), false);
+      assert.equal((await prisma.finding.count({ where: { scanId: pending.id } })), 0);
+      assert.equal(await prisma.auditEvent.count({
+        where: { tenantId: tenantAlpha.id, resourceId: pending.id, action: { in: ["SCAN_COMPLETED", "SCAN_FAILED"] } }
+      }), 0, "stale completion/failure must not create terminal audit entries");
+
+      // A reaper run while the newer lease is healthy must leave it untouched.
+      await scanRepo.reclaimExpiredLeases();
+      const afterStaleReaper = await scanRepo.findById(tenantAlpha.id, pending.id);
+      assert.equal(afterStaleReaper?.status, "running");
+      assert.equal(afterStaleReaper?.leaseToken, tokenB);
+
+      const findingA = { ...staleFinding, requirementId: "token-b-result-a", reason: "token B winner A" };
+      const findingB = { ...staleFinding, requirementId: "token-b-result-b", reason: "token B winner B" };
+      const concurrent = await Promise.allSettled([
+        scanRepo.completeScanWithFindings(leaseB, [findingA], alphaAdminId),
+        scanRepo.completeScanWithFindings(leaseB, [findingB], alphaAdminId)
+      ]);
+      assert.equal(concurrent.filter((result) => result.status === "fulfilled").length, 1);
+      assert.equal(concurrent.filter((result) => result.status === "rejected" && result.reason instanceof StaleWorkerError).length, 1);
+      const finalScan = await scanRepo.findById(tenantAlpha.id, pending.id);
+      assert.equal(finalScan?.status, "completed", "token B must complete successfully");
+      const published = await prisma.finding.findMany({ where: { tenantId: tenantAlpha.id, scanId: pending.id } });
+      assert.equal(published.length, 1, "competing completion cannot publish two result sets");
+      assert.equal(await prisma.auditEvent.count({
+        where: { tenantId: tenantAlpha.id, resourceId: pending.id, action: "SCAN_COMPLETED" }
+      }), 1, "successful completion and audit are committed once");
+      assert.equal(await prisma.auditEvent.count({
+        where: { tenantId: tenantAlpha.id, resourceId: pending.id, action: "SCAN_FAILED" }
+      }), 0);
+    });
+
   } finally {
     await server.stop();
-    await cleanDb();
+    await cleanupTestOwnedFixtures(prisma, tenantIds);
     await prisma.$disconnect();
   }
 }

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 const composeFile = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
 const baseUrls = {
   demo: "http://127.0.0.1:3000",
+  collectorHealth: "http://127.0.0.1:13133/",
   prometheus: "http://127.0.0.1:9090",
   jaeger: "http://127.0.0.1:16686"
 };
@@ -53,10 +54,17 @@ async function fetchJson(url) {
 }
 
 async function main() {
-  run("docker", ["compose", "-f", composeFile, "up", "-d", "--build"]);
+  if (!process.argv.includes("--already-running")) {
+    run("docker", ["compose", "-f", composeFile, "up", "-d", "--build"]);
+  }
 
   await waitFor("/health", async () => {
     const response = await fetch(`${baseUrls.demo}/health`);
+    return response.status === 200;
+  });
+
+  await waitFor("OpenTelemetry Collector health_check extension", async () => {
+    const response = await fetch(baseUrls.collectorHealth);
     return response.status === 200;
   });
 

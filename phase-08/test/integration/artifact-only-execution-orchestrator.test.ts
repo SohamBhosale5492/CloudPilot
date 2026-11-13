@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import { Prisma, PrismaClient } from "@prisma/client";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 import type { RemediationLease } from "../../src/jobs/remediation-repo.js";
 import { RemediationJobRepository } from "../../src/jobs/remediation-repo.js";
 import { PrismaRemediationExecutionLifecycle } from "../../src/jobs/remediation-execution-lifecycle.js";
@@ -15,10 +16,17 @@ import { renderExecutionArtifact, type ArtifactScope } from "../../src/remediati
 import { TrustedClaimExecutionContextService } from "../../src/remediation/trusted-claim-execution-context.js";
 import { RemediationExecutionPersistenceService } from "../../src/remediation/remediation-execution-persistence.js";
 
-const suppliedUrl = process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const suppliedUrl = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_CLAIM_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_claim_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_claim_test";
 if (!suppliedUrl) throw new Error("CLOUDPILOT_CLAIM_TEST_DATABASE_URL is required for orchestrator integration tests.");
 
 function approvedDatabaseUrl(value: string): string {
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return acceptanceDatabase.url;
+  }
   let url: URL;
   try { url = new URL(value); } catch { throw new Error("CLOUDPILOT_CLAIM_TEST_DATABASE_URL is malformed."); }
   let username: string;
@@ -258,9 +266,9 @@ test("PostgreSQL orchestrator authorization and lease integration stays rollback
       SELECT current_database() AS database, current_user AS username,
         inet_server_addr()::text AS address, inet_server_port() AS "serverPort"
     `;
-    assert.equal(identity[0]?.database, "cloudpilot_claim_test");
-    assert.equal(identity[0]?.username, "cloudpilot_claim_test");
-    assert.equal(Number(identity[0]?.serverPort), 5432, "PostgreSQL internal port for the 56433 host mapping");
+    assert.equal(identity[0]?.database, expectedDatabase);
+    assert.equal(identity[0]?.username, expectedUsername);
+    assert.equal(Number(identity[0]?.serverPort), 5432, "PostgreSQL internal port for the dedicated host mapping");
     assert.ok(privateAddress(identity[0]?.address ?? null), "server address must be loopback/private as expected for the dedicated container");
     const trigger = await prisma.$queryRaw<Array<{ enabled: string }>>`
       SELECT tgenabled AS enabled FROM pg_trigger

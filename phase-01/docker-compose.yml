@@ -12,7 +12,7 @@ services:
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_METRIC_EXPORT_INTERVAL_MS: "5000"
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       otel-collector:
         condition: service_started
@@ -34,17 +34,17 @@ services:
     command: ["--config=/etc/otelcol/config.yml"]
     volumes:
       - ./collector/otel-collector-config.yml:/etc/otelcol/config.yml:ro
+    networks:
+      - default
+      - observability
     ports:
-      - "4318:4318"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:13133:13133"
     depends_on:
       jaeger:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13133/ || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-      start_period: 10s
+      disable: true
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -55,7 +55,7 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     depends_on:
       otel-collector:
         condition: service_started
@@ -71,10 +71,15 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"
+      - "127.0.0.1:16686:16686"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:16686/ || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 6
       start_period: 10s
+
+networks:
+  observability:
+    external: true
+    name: cloudpilot-observability

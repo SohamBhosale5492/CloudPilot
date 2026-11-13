@@ -27,19 +27,15 @@
  *  - `createOrFetch` returns the existing row if key already exists.
  */
 
-import crypto from "node:crypto";
 import { URL } from "node:url";
 import { PrismaClient } from "@prisma/client";
 import {
   GitHubConnector,
-  GitHubConflictError,
-  GitHubNotFoundError,
   GitHubApiError,
   GitHubInputError,
   redactSecrets
 } from "../github/github-connector.js";
 import {
-  planRemediation,
   buildIdempotencyKey,
   isRemediationSupported,
   FindingSummary,
@@ -48,6 +44,13 @@ import {
 } from "../remediation/planner.js";
 import { RemediationRepository, Remediation } from "../db/remediation-repo.js";
 import { AuditRepository, RecordAuditInput } from "../db/audit-repo.js";
+import {
+  buildBranchName,
+  GitHubExecutionFailure,
+  GitHubRemediationExecutor
+} from "./github-executor.js";
+
+export { buildBranchName } from "./github-executor.js";
 
 export interface RemediationConfig {
   /** GitHub repository owner (org or user). */
@@ -83,14 +86,6 @@ export interface RepoTarget {
   repo: string;
 }
 
-/**
- * Builds a deterministic, collision-resistant branch name using SHA-256 digest of the idempotency key.
- */
-export function buildBranchName(prefix: string, idempotencyKey: string): string {
-  const hash = crypto.createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 16);
-  return `${prefix}/${hash}`;
-}
-
 export function parseGitHubRepoUrl(urlStr: string): RepoTarget | null {
   try {
     const u = new URL(urlStr);
@@ -110,6 +105,7 @@ export function parseGitHubRepoUrl(urlStr: string): RepoTarget | null {
 }
 
 function isNonRetryableError(err: unknown): boolean {
+  if (err instanceof GitHubExecutionFailure) return !err.retryable;
   if (err instanceof GitHubInputError) return true;
   if (err instanceof MalformedYamlError || err instanceof UnsupportedYamlStructureError) return true;
   if (err instanceof GitHubApiError) {
@@ -125,33 +121,13 @@ function sanitizeError(err: unknown): string {
   return redactSecrets(msg).slice(0, 512);
 }
 
-const PLACEHOLDER_CONTENT: Record<string, string> = {
-  "config/observability/metrics.yaml": [
-    "# CloudPilot Observability — Metrics Configuration",
-    "# cloudpilot:metrics",
-    "metrics: []",
-    ""
-  ].join("\n"),
-  "config/observability/health-checks.yaml": [
-    "# CloudPilot Observability — Health Checks",
-    "# cloudpilot:health-checks",
-    "health_checks: []",
-    ""
-  ].join("\n"),
-  "config/observability/alert-rules.yaml": [
-    "# CloudPilot Observability — Alert Rules",
-    "# cloudpilot:alert-rules",
-    "alerts: []",
-    ""
-  ].join("\n")
-};
-
 export class RemediationOrchestrator {
   private readonly remediationRepo: RemediationRepository;
   private readonly auditRepo: AuditRepository;
   private readonly baseBranch: string;
   private readonly branchPrefix: string;
   private readonly draft: boolean;
+  private readonly githubExecutor: GitHubRemediationExecutor;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -164,6 +140,11 @@ export class RemediationOrchestrator {
     this.baseBranch = config.baseBranch ?? "main";
     this.branchPrefix = config.branchPrefix ?? "cloudpilot/remediate";
     this.draft = config.draft ?? true;
+    this.githubExecutor = new GitHubRemediationExecutor(github, {
+      baseBranch: this.baseBranch,
+      branchPrefix: this.branchPrefix,
+      draft: this.draft
+    });
   }
 
   private async resolveRepoTarget(tenantId: string, projectId: string): Promise<RepoTarget> {
@@ -246,9 +227,11 @@ export class RemediationOrchestrator {
       };
     }
 
-    // Plan the patch
-    const patch = planRemediation(finding);
-    const branchName = buildBranchName(this.branchPrefix, idempotencyKey);
+    // Prepare the deterministic patch before creating the lifecycle record,
+    // preserving Phase 07's existing validation and persistence ordering.
+    const prepared = this.githubExecutor.prepare(finding, idempotencyKey);
+    const patch = prepared.patch;
+    const branchName = prepared.branchName;
     const targetRepo = await this.resolveRepoTarget(tenantId, projectId);
 
     // Create or fetch the DB record
@@ -278,122 +261,56 @@ export class RemediationOrchestrator {
     });
 
     try {
-      // 1. Check if PR already exists for this branch (idempotent PR check)
-      const existingPr = await this.github.findOpenPullRequest(
-        targetRepo.owner,
-        targetRepo.repo,
-        branchName,
-        this.baseBranch
-      );
+      const outcome = await this.githubExecutor.execute(targetRepo, prepared);
+      if (outcome.kind === "failed") {
+        throw new GitHubExecutionFailure(outcome.message, outcome.retryable, outcome.errorCode);
+      }
 
-      if (existingPr) {
-        // PR already open — update DB record, audit, and return
+      if (outcome.kind === "already-completed") {
         await this.remediationRepo.update(tenantId, record.id, {
-          status: "open",
-          branchName,
-          prNumber: existingPr.number,
-          prUrl: existingPr.url,
+          status: "merged",
+          branchName: outcome.branchName,
+          prNumber: outcome.prNumber,
+          prUrl: outcome.prUrl,
           errorMessage: null
         });
-
-        await this.recordAuditSafe({
-          tenantId,
-          actorId: options?.actorId ?? "system",
-          action: "REMEDIATION_PR_OPENED",
-          resourceType: "remediation",
-          resourceId: record.id,
-          projectId,
-          metadata: {
-            scanId,
-            findingId,
-            branchName,
-            prNumber: existingPr.number,
-            prUrl: existingPr.url
-          }
-        });
-
         return {
           remediationId: record.id,
-          status: "open",
-          branchName,
-          prNumber: existingPr.number,
-          prUrl: existingPr.url,
-          summary: patch.summary
+          status: "merged",
+          branchName: outcome.branchName,
+          prNumber: outcome.prNumber,
+          prUrl: outcome.prUrl,
+          summary: outcome.summary,
+          skipped: true,
+          skipReason: "The deterministic remediation pull request is already merged."
         };
       }
 
-      // 2. Get base branch SHA
-      const baseBranchInfo = await this.github.getBranchSha(
-        targetRepo.owner,
-        targetRepo.repo,
-        this.baseBranch
-      );
-
-      // 3. Create sandbox branch (ignore conflict if already exists)
-      try {
-        await this.github.createBranch(
-          targetRepo.owner,
-          targetRepo.repo,
-          branchName,
-          baseBranchInfo.sha
-        );
-      } catch (err) {
-        if (!(err instanceof GitHubConflictError)) throw err;
+      if (outcome.kind === "manual-review") {
+        await this.remediationRepo.update(tenantId, record.id, {
+          status: "closed",
+          branchName: outcome.branchName,
+          prNumber: outcome.prNumber,
+          prUrl: outcome.prUrl,
+          errorMessage: outcome.message
+        });
+        return {
+          remediationId: record.id,
+          status: "closed",
+          branchName: outcome.branchName,
+          prNumber: outcome.prNumber,
+          prUrl: outcome.prUrl,
+          summary: outcome.summary,
+          skipped: true,
+          skipReason: outcome.message
+        };
       }
 
-      // 4. Read current file content (or use placeholder if file doesn't exist yet)
-      let currentContent: string;
-      let currentSha: string;
-
-      try {
-        const fileInfo = await this.github.getFileContent(
-          targetRepo.owner,
-          targetRepo.repo,
-          patch.filePath,
-          branchName
-        );
-        currentContent = fileInfo.content;
-        currentSha = fileInfo.sha;
-      } catch (err) {
-        if (err instanceof GitHubNotFoundError) {
-          currentContent = PLACEHOLDER_CONTENT[patch.filePath] ?? "# CloudPilot Observability\n";
-          currentSha = "";
-        } else {
-          throw err;
-        }
-      }
-
-      // 5. Apply deterministic patch
-      const patchedContent = patch.applyPatch(currentContent);
-
-      // 6. Commit file to sandbox branch
-      await this.github.updateFile({
-        owner: targetRepo.owner,
-        repo: targetRepo.repo,
-        path: patch.filePath,
-        message: patch.commitMessage,
-        content: patchedContent,
-        sha: currentSha,
-        branch: branchName
-      });
-
-      // 7. Open pull request
-      const pr = await this.github.createPullRequest({
-        owner: targetRepo.owner,
-        repo: targetRepo.repo,
-        title: patch.prTitle,
-        body: patch.prBody,
-        head: branchName,
-        base: this.baseBranch,
-        draft: this.draft
-      });
-
-      // 8. Persist success
       await this.remediationRepo.update(tenantId, record.id, {
         status: "open",
-        branchName,
-        prNumber: pr.number,
-        prUrl: pr.url,
+        branchName: outcome.branchName,
+        prNumber: outcome.prNumber,
+        prUrl: outcome.prUrl,
         errorMessage: null
       });
 
@@ -407,19 +324,19 @@ export class RemediationOrchestrator {
         metadata: {
           scanId,
           findingId,
-          branchName,
-          prNumber: pr.number,
-          prUrl: pr.url
+          branchName: outcome.branchName,
+          prNumber: outcome.prNumber,
+          prUrl: outcome.prUrl
         }
       });
 
       return {
         remediationId: record.id,
         status: "open",
-        branchName,
-        prNumber: pr.number,
-        prUrl: pr.url,
-        summary: patch.summary
+        branchName: outcome.branchName,
+        prNumber: outcome.prNumber,
+        prUrl: outcome.prUrl,
+        summary: outcome.summary
       };
     } catch (err) {
       const errorMessage = sanitizeError(err);

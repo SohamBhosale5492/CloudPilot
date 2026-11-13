@@ -1,7 +1,8 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
 import { PrismaClient } from "@prisma/client";
-import { verifyJwtToken, JwtVerifierConfig, AuthenticatedIdentity } from "../auth/jwt-verifier.js";
+import { classifyJwtVerificationFailure, isDevelopmentEnvironment, logDevelopmentIssuerMismatch, verifyJwtToken, JwtVerifierConfig, AuthenticatedIdentity } from "../auth/jwt-verifier.js";
 import { hasPermission, Permission } from "../rbac/guard.js";
 import { ProjectRepository, InvalidCursorError } from "../db/project-repo.js";
 import { ScanRepository } from "../db/scan-repo.js";
@@ -20,14 +21,38 @@ function parseLimitParam(param: string | null): number | undefined {
 
 export interface ServerConfig {
   port?: number;
+  host?: string;
   prisma: PrismaClient;
   jwtConfig: JwtVerifierConfig;
   scanRunner?: BoundedScanRunner;
   fetchImpl?: typeof fetch;
+  routeExtensions?: AuthenticatedRouteExtension[];
+}
+
+/** A route extension runs only after the server's standard JWT authentication. */
+export interface AuthenticatedRouteContext {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  method: string;
+  pathname: string;
+  url: URL;
+  identity: AuthenticatedIdentity;
+  parseJsonBody(): Promise<unknown>;
+  sendJson(statusCode: number, data: unknown): void;
+}
+
+export interface AuthenticatedRouteExtension {
+  handle(context: AuthenticatedRouteContext): Promise<boolean>;
+  initialize?(): Promise<void>;
+  shutdown?(): Promise<void>;
 }
 
 export class CloudPilotApiServer {
   private server: http.Server | null = null;
+  private startPromise: Promise<number> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private lifecycleStopped = false;
+  private lifecycleReady = false;
   private readonly prisma: PrismaClient;
   private readonly jwtConfig: JwtVerifierConfig;
   private readonly projectRepo: ProjectRepository;
@@ -35,6 +60,7 @@ export class CloudPilotApiServer {
   private readonly findingRepo: FindingRepository;
   private readonly auditRepo: AuditRepository;
   private readonly scanRunner: BoundedScanRunner;
+  private readonly routeExtensions: AuthenticatedRouteExtension[];
 
   constructor(private readonly config: ServerConfig) {
     this.prisma = config.prisma;
@@ -44,47 +70,109 @@ export class CloudPilotApiServer {
     this.findingRepo = new FindingRepository(this.prisma);
     this.auditRepo = new AuditRepository(this.prisma);
     this.scanRunner = config.scanRunner ?? new BoundedScanRunner(this.prisma, { fetchImpl: config.fetchImpl });
+    this.routeExtensions = config.routeExtensions ?? [];
   }
 
-  async start(port = 0): Promise<number> {
-    await this.scanRunner.initialize();
-
-    return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
-        this.handleRequest(req, res).catch((err) => {
-          const statusCode =
-            err && typeof err === "object" && "statusCode" in err && typeof (err as { statusCode: unknown }).statusCode === "number"
-              ? (err as { statusCode: number }).statusCode
-              : 500;
-          this.sendJson(res, statusCode, { error: sanitizeErrorDetails(err) });
-        });
-      });
-
-      this.server.listen(port, () => {
-        const addr = this.server?.address();
-        if (typeof addr === "object" && addr !== null) {
-          resolve(addr.port);
-        } else {
-          resolve(port);
-        }
-      });
-
-      this.server.on("error", reject);
-    });
+  start(port = this.config.port ?? 0, host = this.config.host ?? "127.0.0.1"): Promise<number> {
+    if (this.startPromise) return this.startPromise;
+    if (this.lifecycleStopped) return Promise.reject(new Error("API server has already been stopped."));
+    this.startPromise = this.startInternal(port, host);
+    return this.startPromise;
   }
 
-  async stop(): Promise<void> {
-    await this.scanRunner.shutdown();
-    return new Promise((resolve) => {
-      if (this.server) {
-        this.server.close(() => {
-          this.server = null;
-          resolve();
-        });
-      } else {
-        resolve();
+  private async startInternal(port: number, host: string): Promise<number> {
+    try {
+      await this.scanRunner.initialize();
+      for (const extension of this.routeExtensions) {
+        await extension.initialize?.();
       }
+
+      return await new Promise<number>((resolve, reject) => {
+        this.server = http.createServer((req, res) => {
+          this.handleRequest(req, res).catch((err) => {
+            const statusCode =
+              err && typeof err === "object" && "statusCode" in err && typeof (err as { statusCode: unknown }).statusCode === "number"
+                ? (err as { statusCode: number }).statusCode
+                : 500;
+            this.sendJson(res, statusCode, { error: sanitizeErrorDetails(err) });
+          });
+        });
+
+        this.server.once("error", reject);
+        this.server.listen(port, host, () => {
+          this.server?.removeAllListeners("error");
+          this.lifecycleReady = true;
+          const addr = this.server?.address();
+          if (typeof addr === "object" && addr !== null) resolve(addr.port);
+          else resolve(port);
+        });
+      });
+    } catch (error) {
+      this.lifecycleReady = false;
+      try {
+        if (this.server?.listening) await this.closeHttpServer();
+        else this.server = null;
+      } catch {
+        this.server = null;
+      }
+      try {
+        await this.cleanupRuntime();
+      } catch {
+        // Preserve the startup error; all cleanup steps are attempted independently.
+      }
+      this.lifecycleStopped = true;
+      this.stopPromise = Promise.resolve();
+      throw error;
+    }
+  }
+
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.lifecycleReady = false;
+    this.lifecycleStopped = true;
+    this.stopPromise = this.stopRuntime();
+    return this.stopPromise;
+  }
+
+  private async stopRuntime(): Promise<void> {
+    let firstError: unknown;
+    try {
+      await this.closeHttpServer();
+    } catch (error) {
+      firstError = error;
+    }
+    try {
+      await this.cleanupRuntime();
+    } catch (error) {
+      firstError ??= error;
+    }
+    if (firstError) throw firstError;
+  }
+
+  private async closeHttpServer(): Promise<void> {
+    const server = this.server;
+    if (!server) return;
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
     });
+    this.server = null;
+  }
+
+  private async cleanupRuntime(): Promise<void> {
+    let firstError: unknown;
+    for (const extension of [...this.routeExtensions].reverse()) {
+      try {
+        await extension.shutdown?.();
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    try {
+      await this.scanRunner.shutdown();
+    } catch (error) {
+      firstError ??= error;
+    }
+    if (firstError) throw firstError;
   }
 
   private sendJson(res: http.ServerResponse, statusCode: number, data: unknown): void {
@@ -126,15 +214,22 @@ export class CloudPilotApiServer {
     });
   }
 
-  private async authenticate(req: http.IncomingMessage): Promise<AuthenticatedIdentity | null> {
+  private async authenticate(req: http.IncomingMessage, requestId: string): Promise<AuthenticatedIdentity | null> {
     const authHeader = req.headers["authorization"];
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      console.warn(JSON.stringify({ category: "malformed_token", requestId }));
       return null;
     }
 
     const token = authHeader.slice("Bearer ".length).trim();
     const result = await verifyJwtToken(token, this.jwtConfig);
     if (!result.valid || !result.securityContext) {
+      const category = classifyJwtVerificationFailure(result) ?? "other_verification_failure";
+      if (isDevelopmentEnvironment() && category === "issuer_mismatch") {
+        logDevelopmentIssuerMismatch(token, this.jwtConfig.expectedIssuer, requestId);
+        return null;
+      }
+      console.warn(JSON.stringify({ category, requestId }));
       return null;
     }
 
@@ -153,15 +248,15 @@ export class CloudPilotApiServer {
     }
 
     if (method === "GET" && pathname === "/health/readiness") {
+      if (!this.lifecycleReady || this.lifecycleStopped) {
+        this.sendJson(res, 503, { status: "unready" });
+        return;
+      }
       const dbHealth = await checkDatabaseConnection(this.prisma);
-      if (dbHealth.ok) {
+      if (dbHealth.ok && this.lifecycleReady && !this.lifecycleStopped) {
         this.sendJson(res, 200, { status: "ready" });
       } else {
-        this.sendJson(res, 503, {
-          status: "unhealthy",
-          error: dbHealth.error,
-          remedy: dbHealth.remedy
-        });
+        this.sendJson(res, 503, { status: "unready" });
       }
       return;
     }
@@ -172,13 +267,30 @@ export class CloudPilotApiServer {
       return;
     }
 
-    const identity = await this.authenticate(req);
+    const requestId = randomUUID();
+    res.setHeader("X-Request-ID", requestId);
+    const identity = await this.authenticate(req, requestId);
     if (!identity) {
       this.sendJson(res, 401, { error: "Unauthorized: Missing, invalid, or expired authentication token." });
       return;
     }
 
     const tenantId = identity.tenantId;
+
+    // Phase-specific handlers share the API server's authentication lifecycle.
+    for (const extension of this.routeExtensions) {
+      const handled = await extension.handle({
+        req,
+        res,
+        method,
+        pathname,
+        url: parsedUrl,
+        identity,
+        parseJsonBody: () => this.parseJsonBody(req),
+        sendJson: (statusCode, data) => this.sendJson(res, statusCode, data)
+      });
+      if (handled) return;
+    }
 
     // 3. Route Dispatch
     // ─── GET /api/v1/projects ───

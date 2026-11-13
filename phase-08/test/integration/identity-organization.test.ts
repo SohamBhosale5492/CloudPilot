@@ -5,8 +5,12 @@ import test from "node:test";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { PrismaIdentityResolver } from "../../src/identity/identity-resolver.js";
 import { PrismaOrganizationService } from "../../src/organizations/organization-service.js";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 
-const testUrl = process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const testUrl = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_phase08_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_phase08_test";
 const migrationNames = [
   "20261014000000_init",
   "20261023000000_durable_jobs",
@@ -24,11 +28,16 @@ const migrationNames = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ];
 
 function assertDedicatedUrl(value: string | undefined): asserts value is string {
   if (!value) throw new Error("CLOUDPILOT_PHASE08_TEST_DATABASE_URL is required for identity integration tests.");
+  if (acceptanceDatabase) {
+    if (value !== acceptanceDatabase.url) throw new Error("Refusing a database URL different from the validated acceptance target.");
+    return;
+  }
   const url = new URL(value);
   const databaseName = decodeURIComponent(url.pathname.slice(1));
   if (!(["postgres:", "postgresql:"].includes(url.protocol)) ||
@@ -44,8 +53,9 @@ test("SaaS identity and organization persistence is isolated and transactional",
   assertDedicatedUrl(testUrl);
   const prisma = new PrismaClient({ datasources: { db: { url: testUrl } } });
   await prisma.$connect();
-  const database = await prisma.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
-  assert.equal(database[0]?.name, "cloudpilot_phase08_test");
+  const database = await prisma.$queryRaw<Array<{ name: string; user: string }>>`SELECT current_database() AS name, current_user AS user`;
+  assert.equal(database[0]?.name, expectedDatabase);
+  assert.equal(database[0]?.user, expectedUsername);
   const migrations = await prisma.$queryRaw<Array<{ migration_name: string; checksum: string; finished_at: Date | null; rolled_back_at: Date | null }>>`
     SELECT migration_name, checksum, finished_at, rolled_back_at FROM "_prisma_migrations" ORDER BY migration_name
   `;
@@ -63,7 +73,7 @@ test("SaaS identity and organization persistence is isolated and transactional",
   const adoptionIds = new Set<string>();
   t.after(async () => {
     const beforeCleanup = await prisma.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
-    assert.equal(beforeCleanup[0]?.name, "cloudpilot_phase08_test", "refuse cleanup outside dedicated database");
+    assert.equal(beforeCleanup[0]?.name, expectedDatabase, "refuse cleanup outside dedicated database");
     await prisma.$transaction(async (tx) => {
       if (organizationIds.size) {
         await tx.organizationAuditEvent.deleteMany({ where: { organizationId: { in: [...organizationIds] } } });

@@ -38,7 +38,8 @@ export class GitHubApiError extends Error {
   constructor(
     message: string,
     public readonly statusCode: number,
-    public readonly responseBody: string
+    public readonly responseBody: string,
+    public readonly retryAfter?: string
   ) {
     super(message);
     this.name = "GitHubApiError";
@@ -229,16 +230,19 @@ export class GitHubConnector {
     method: string,
     path: string,
     body?: unknown,
-    maxBytes = MAX_RESPONSE_BYTES
+    maxBytes = MAX_RESPONSE_BYTES,
+    signal?: AbortSignal
   ): Promise<T> {
     const url = `${this.apiBase}${path}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const onAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
 
-    let res: Response;
     try {
-      res = await this.fetchImpl(url, {
+      const res = await this.fetchImpl(url, {
         method,
         signal: controller.signal as AbortSignal,
         headers: {
@@ -251,32 +255,34 @@ export class GitHubConnector {
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         redirect: "error"    // never follow redirects
       });
+      // Keep both caller cancellation and the request timeout active while the
+      // bounded response body is read, not just until fetch() returns headers.
+      const text = await this.readBoundedBody(res, maxBytes);
+
+      if (!res.ok) {
+        const safeBody = redactSecrets(text);
+        const safeMsg = redactSecrets(text.slice(0, 512));
+        if (res.status === 404) throw new GitHubNotFoundError(`GitHub 404: ${safeMsg}`, safeBody);
+        if (res.status === 422) throw new GitHubConflictError(`GitHub 422: ${safeMsg}`, safeBody);
+        throw new GitHubApiError(
+          `GitHub ${res.status}: ${safeMsg}`,
+          res.status,
+          safeBody,
+          res.status === 429 ? res.headers.get("retry-after") ?? undefined : undefined
+        );
+      }
+
+      if (!text) return {} as T;
+      return JSON.parse(text) as T;
     } catch (err) {
       if (err instanceof GitHubApiError) throw err;
       const rawMsg = err instanceof Error ? err.message : String(err);
       const safeMsg = redactSecrets(rawMsg);
-      throw new GitHubApiError(
-        `GitHub request failed: ${safeMsg}`,
-        0,
-        ""
-      );
+      throw new GitHubApiError(`GitHub request failed: ${safeMsg}`, 0, "");
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
-
-    // Read bounded response
-    const text = await this.readBoundedBody(res, maxBytes);
-
-    if (!res.ok) {
-      const safeBody = redactSecrets(text);
-      const safeMsg = redactSecrets(text.slice(0, 512));
-      if (res.status === 404) throw new GitHubNotFoundError(`GitHub 404: ${safeMsg}`, safeBody);
-      if (res.status === 422) throw new GitHubConflictError(`GitHub 422: ${safeMsg}`, safeBody);
-      throw new GitHubApiError(`GitHub ${res.status}: ${safeMsg}`, res.status, safeBody);
-    }
-
-    if (!text) return {} as T;
-    return JSON.parse(text) as T;
   }
 
   private async readBoundedBody(res: Response, maxBytes: number): Promise<string> {
@@ -318,7 +324,7 @@ export class GitHubConnector {
   /**
    * Resolves the current SHA of the default branch tip (typically "main").
    */
-  async getBranchSha(owner: string, repo: string, branch: string): Promise<BranchInfo> {
+  async getBranchSha(owner: string, repo: string, branch: string, signal?: AbortSignal): Promise<BranchInfo> {
     assertSafeOwner(owner);
     assertSafeRepo(repo);
     assertSafeBranch(branch);
@@ -326,7 +332,10 @@ export class GitHubConnector {
     const safeBranchPath = branch.split("/").map(encodeURIComponent).join("/");
     const data = await this.request<{ object: { sha: string } }>(
       "GET",
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs/heads/${safeBranchPath}`
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs/heads/${safeBranchPath}`,
+      undefined,
+      MAX_RESPONSE_BYTES,
+      signal
     );
     return { name: branch, sha: data.object.sha };
   }
@@ -335,7 +344,7 @@ export class GitHubConnector {
    * Creates a new branch from a given commit SHA.
    * Throws GitHubConflictError if branch already exists.
    */
-  async createBranch(owner: string, repo: string, branch: string, fromSha: string): Promise<void> {
+  async createBranch(owner: string, repo: string, branch: string, fromSha: string, signal?: AbortSignal): Promise<void> {
     assertSafeOwner(owner);
     assertSafeRepo(repo);
     assertSafeBranch(branch);
@@ -346,7 +355,9 @@ export class GitHubConnector {
     await this.request(
       "POST",
       `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
-      { ref: `refs/heads/${branch}`, sha: fromSha }
+      { ref: `refs/heads/${branch}`, sha: fromSha },
+      MAX_RESPONSE_BYTES,
+      signal
     );
   }
 
@@ -358,7 +369,8 @@ export class GitHubConnector {
     owner: string,
     repo: string,
     path: string,
-    branch: string
+    branch: string,
+    signal?: AbortSignal
   ): Promise<FileContent> {
     assertSafeOwner(owner);
     assertSafeRepo(repo);
@@ -375,7 +387,8 @@ export class GitHubConnector {
       "GET",
       `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${safeFilePath}?ref=${encodeURIComponent(branch)}`,
       undefined,
-      MAX_CONTENT_BYTES
+      MAX_CONTENT_BYTES,
+      signal
     );
 
     const raw = Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
@@ -386,7 +399,7 @@ export class GitHubConnector {
    * Creates or updates a file on a branch.
    * Requires the current blob SHA for updates (prevents lost-update races).
    */
-  async updateFile(input: UpdateFileInput): Promise<string> {
+  async updateFile(input: UpdateFileInput, signal?: AbortSignal): Promise<string> {
     assertSafeOwner(input.owner);
     assertSafeRepo(input.repo);
     assertSafePath(input.path);
@@ -403,7 +416,9 @@ export class GitHubConnector {
         content: encoded,
         sha: input.sha,
         branch: input.branch
-      }
+      },
+      MAX_RESPONSE_BYTES,
+      signal
     );
     return data.content.sha;
   }
@@ -412,7 +427,7 @@ export class GitHubConnector {
    * Opens a pull request. Returns the PR number and URL.
    * Throws GitHubConflictError if an identical PR already exists.
    */
-  async createPullRequest(input: CreatePrInput): Promise<PullRequest> {
+  async createPullRequest(input: CreatePrInput, signal?: AbortSignal): Promise<PullRequest> {
     assertSafeOwner(input.owner);
     assertSafeRepo(input.repo);
     assertSafeBranch(input.head);
@@ -434,7 +449,9 @@ export class GitHubConnector {
         head: input.head,
         base: input.base,
         draft: input.draft ?? false
-      }
+      },
+      MAX_RESPONSE_BYTES,
+      signal
     );
 
     return {
@@ -455,7 +472,8 @@ export class GitHubConnector {
     owner: string,
     repo: string,
     head: string,
-    base: string
+    base: string,
+    signal?: AbortSignal
   ): Promise<PullRequest | null> {
     assertSafeOwner(owner);
     assertSafeRepo(repo);
@@ -471,7 +489,10 @@ export class GitHubConnector {
       base: { ref: string };
     }>>(
       "GET",
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(owner + ":" + head)}&base=${encodeURIComponent(base)}&per_page=5`
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(owner + ":" + head)}&base=${encodeURIComponent(base)}&per_page=5`,
+      undefined,
+      MAX_RESPONSE_BYTES,
+      signal
     );
 
     if (!Array.isArray(data) || data.length === 0) return null;
@@ -484,6 +505,70 @@ export class GitHubConnector {
       url: match.html_url,
       title: match.title,
       state: match.state,
+      headBranch: match.head.ref,
+      baseBranch: match.base.ref
+    };
+  }
+
+  /**
+   * Finds a PR for the deterministic head/base pair in any state. GitHub's
+   * `state=closed` response includes merged PRs, distinguished by merged_at.
+   * Existing findOpenPullRequest behavior is intentionally unchanged.
+   */
+  async findPullRequestByHead(
+    owner: string,
+    repo: string,
+    head: string,
+    base: string,
+    signal?: AbortSignal
+  ): Promise<PullRequest | null> {
+    assertSafeOwner(owner);
+    assertSafeRepo(repo);
+    assertSafeBranch(head);
+    assertSafeBranch(base);
+
+    type PullRequestRecord = {
+      number: number;
+      html_url: string;
+      title: string;
+      state: string;
+      merged_at?: string | null;
+      head: { ref: string };
+      base: { ref: string };
+    };
+    const matches: PullRequestRecord[] = [];
+    const maxPages = 100;
+    for (let page = 1; page <= maxPages; page++) {
+      const data = await this.request<PullRequestRecord[]>(
+        "GET",
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=all&head=${encodeURIComponent(owner + ":" + head)}&base=${encodeURIComponent(base)}&per_page=100&page=${page}`,
+        undefined,
+        MAX_RESPONSE_BYTES,
+        signal
+      );
+      if (!Array.isArray(data)) {
+        throw new Error("GitHub returned an invalid pull request history response.");
+      }
+      matches.push(...data.filter((pr) => pr.head?.ref === head && pr.base?.ref === base));
+      if (data.length < 100) break;
+      if (page === maxPages) {
+        // Fail closed rather than creating a PR without having enumerated all
+        // historical PRs for this deterministic branch.
+        throw new Error("Pull request history exceeds the reconciliation limit.");
+      }
+    }
+
+    const match = matches.find((pr) => pr.state === "open") ??
+      matches.find((pr) => Boolean(pr.merged_at) || pr.state === "merged") ??
+      matches.find((pr) => pr.state === "closed") ??
+      matches[0];
+    if (!match) return null;
+
+    return {
+      number: match.number,
+      url: match.html_url,
+      title: match.title,
+      state: match.merged_at || match.state === "merged" ? "merged" : match.state,
       headBranch: match.head.ref,
       baseBranch: match.base.ref
     };

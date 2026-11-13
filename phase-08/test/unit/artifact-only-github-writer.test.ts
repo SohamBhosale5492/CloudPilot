@@ -304,6 +304,11 @@ function setup(options: { sourceExists?: boolean; sourceContent?: string; baseRe
         githubRepositoryId: db.remediation.githubRepositoryId, artifactHash: db.remediation.executionArtifactHash,
         baseRef: "main", baseCommitSha: baseSha }];
       if (sql.includes("FROM remediations")) return [{ ...db.remediation }];
+      if (sql.includes("cloudpilot_lock_active_organization") || sql.includes("cloudpilot_lock_scoped_finding") ||
+          sql.includes("cloudpilot_lock_active_binding_installation")) return [{ locked: true }];
+      if (sql.includes("cloudpilot_lock_active_member") || sql.includes("cloudpilot_lock_active_actor_for_update")) {
+        return [{ role: db.approverMembership.role }];
+      }
       return [{ id: "locked" }];
     },
     $executeRaw: async (parts: TemplateStringsArray, ...values: unknown[]) => {

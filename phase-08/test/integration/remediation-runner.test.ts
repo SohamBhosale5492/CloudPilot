@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { PrismaClient } from "@prisma/client";
+import { parsePhase08AcceptanceDatabase } from "./acceptance-database.js";
 import {
   RemediationJobRepository
 } from "../../src/jobs/remediation-repo.js";
 
-const explicitTestDatabaseUrl = process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const acceptanceDatabase = parsePhase08AcceptanceDatabase(process.env.CLOUDPILOT_PHASE08_ACCEPTANCE_TEST_DATABASE_URL);
+const explicitTestDatabaseUrl = acceptanceDatabase?.url ?? process.env.CLOUDPILOT_PHASE08_TEST_DATABASE_URL;
+const expectedDatabase = acceptanceDatabase?.database ?? "cloudpilot_phase08_test";
+const expectedUsername = acceptanceDatabase?.username ?? "cloudpilot_phase08_test";
 function isDedicatedTestDatabase(value: string | undefined): boolean {
   if (!value) return false;
+  if (acceptanceDatabase) return value === acceptanceDatabase.url;
   try {
     const url = new URL(value);
     return ["postgres:", "postgresql:"].includes(url.protocol) &&
@@ -39,7 +44,8 @@ const CANONICAL_MIGRATIONS = [
   "20261107130000_system_recovery_lease",
   "20261108120000_remote_mutation_rejected",
   "20261109120000_remediation_execution_retry",
-  "20261110120000_allow_mutation_rejection_resource_type"
+  "20261110120000_allow_mutation_rejection_resource_type",
+  "20261111120000_runtime_lock_helpers"
 ];
 
 async function seedTenant(prisma: PrismaClient): Promise<{ tenantId: string; projectId: string; scanId: string }> {
@@ -109,8 +115,8 @@ test("legacy PostgreSQL queue rows cannot be claimed without the durable executi
 
   try {
     const database = await prisma.$queryRaw<Array<{ name: string; user: string }>>`SELECT current_database() AS name, current_user AS user;`;
-    assert.equal(database[0]?.name, "cloudpilot_phase08_test");
-    assert.equal(database[0]?.user, "cloudpilot_phase08_test");
+    assert.equal(database[0]?.name, expectedDatabase);
+    assert.equal(database[0]?.user, expectedUsername);
     const migrations = await prisma.$queryRaw<Array<{ migration_name: string; finished_at: Date | null; rolled_back_at: Date | null }>>`
       SELECT migration_name, finished_at, rolled_back_at
       FROM "_prisma_migrations"

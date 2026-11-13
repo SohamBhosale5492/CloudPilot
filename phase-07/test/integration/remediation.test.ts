@@ -1,8 +1,8 @@
 /**
  * Phase 07 Integration Tests — Remediation lifecycle against real PostgreSQL.
  *
- * Prerequisites (same as Phase 06):
- *   - PostgreSQL running at DATABASE_URL (cloudpilot_test db)
+ * Requires CLOUDPILOT_FIXTURE_TEST_DATABASE_URL for the isolated
+ * cloudpilot_runtime_role_test database and fixture-only role on loopback port 56440.
  *   - Phase 06 migrations already applied
  *   - Phase 07 migration applied (remediations table)
  *
@@ -27,6 +27,7 @@
 
 import assert from "node:assert/strict";
 import { test, before, after } from "node:test";
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { URL } from "node:url";
 import { PrismaClient } from "@prisma/client";
@@ -34,15 +35,16 @@ import { GitHubConnector } from "../../src/github/github-connector.js";
 import { RemediationOrchestrator, buildBranchName } from "../../src/remediation/orchestrator.js";
 import { RemediationRepository, InvalidCursorError } from "../../src/db/remediation-repo.js";
 import { buildIdempotencyKey } from "../../src/remediation/planner.js";
+import { requireIntegrationFixtureDatabaseUrl } from "../../../test-support/integration-database.js";
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
-const DATABASE_URL = process.env.DATABASE_URL ?? "postgresql://cloudpilot:cloudpilot_password@localhost:5432/cloudpilot_test";
-process.env.DATABASE_URL = DATABASE_URL;
+const DATABASE_URL = requireIntegrationFixtureDatabaseUrl(process.env.CLOUDPILOT_FIXTURE_TEST_DATABASE_URL);
 
 let prisma: PrismaClient;
 let tenantId: string;
 let tenantBId: string;
+const fixtureTenantIds: string[] = [];
 let projectId: string;
 let projectBId: string;
 let scanId: string;
@@ -205,26 +207,38 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
 
 before(async () => {
   prisma = new PrismaClient({ datasources: { db: { url: DATABASE_URL } } });
+  await prisma.$connect();
+  const target = await prisma.$queryRaw<Array<{ database: string; role: string; serverPort: number }>>`
+    SELECT current_database() AS database, current_user AS role, inet_server_port() AS "serverPort"
+  `;
+  if (target[0]?.database !== "cloudpilot_runtime_role_test" || target[0]?.role !== "cloudpilot_integration_test" ||
+      target[0]?.serverPort !== 5432) {
+    await prisma.$disconnect();
+    throw new Error("Phase 07 integration database identity mismatch; refusing fixture creation.");
+  }
   mockGhBaseUrl = await startMockGitHub();
   resetGhState();
 
   // Create tenant A
-  const tenantA = await prisma.tenant.create({ data: { name: `phase07-test-${Date.now()}` } });
+  const runId = randomUUID();
+  const tenantA = await prisma.tenant.create({ data: { name: `phase07-test-${runId}` } });
   tenantId = tenantA.id;
+  fixtureTenantIds.push(tenantId);
 
   // Create tenant B (isolation tests)
-  const tenantB = await prisma.tenant.create({ data: { name: `phase07-test-B-${Date.now()}` } });
+  const tenantB = await prisma.tenant.create({ data: { name: `phase07-test-B-${runId}` } });
   tenantBId = tenantB.id;
+  fixtureTenantIds.push(tenantBId);
 
   // Create project for tenant A
   const proj = await prisma.project.create({
-    data: { tenantId, name: `proj-07-${Date.now()}` }
+    data: { tenantId, name: `proj-07-${runId}` }
   });
   projectId = proj.id;
 
   // Create project for tenant B
   const projB = await prisma.project.create({
-    data: { tenantId: tenantBId, name: `proj-07-B-${Date.now()}` }
+    data: { tenantId: tenantBId, name: `proj-07-B-${runId}` }
   });
   projectBId = projB.id;
 
@@ -261,19 +275,22 @@ before(async () => {
 });
 
 after(async () => {
-  // Clean up test data in correct cascade order
-  await prisma.auditEvent.deleteMany({ where: { tenantId: { in: [tenantId, tenantBId] } } });
-  await prisma.remediation.deleteMany({ where: { tenantId } });
-  await prisma.remediation.deleteMany({ where: { tenantId: tenantBId } });
-  await prisma.finding.deleteMany({ where: { tenantId } });
-  await prisma.finding.deleteMany({ where: { tenantId: tenantBId } });
-  await prisma.scan.deleteMany({ where: { tenantId } });
-  await prisma.scan.deleteMany({ where: { tenantId: tenantBId } });
-  await prisma.project.deleteMany({ where: { tenantId } });
-  await prisma.project.deleteMany({ where: { tenantId: tenantBId } });
-  await prisma.tenant.deleteMany({ where: { id: { in: [tenantId, tenantBId] } } });
-  await prisma.$disconnect();
-  await new Promise<void>((r) => mockGhServer.close(() => r()));
+  // Only delete rows belonging to tenant IDs successfully created by this run.
+  // Empty/undefined filters must never turn a partial setup failure into a broad delete.
+  try {
+    if (prisma && fixtureTenantIds.length > 0) {
+      const ownedTenants = [...fixtureTenantIds];
+      await prisma.auditEvent.deleteMany({ where: { tenantId: { in: ownedTenants } } });
+      await prisma.remediation.deleteMany({ where: { tenantId: { in: ownedTenants } } });
+      await prisma.finding.deleteMany({ where: { tenantId: { in: ownedTenants } } });
+      await prisma.scan.deleteMany({ where: { tenantId: { in: ownedTenants } } });
+      await prisma.project.deleteMany({ where: { tenantId: { in: ownedTenants } } });
+      await prisma.tenant.deleteMany({ where: { id: { in: ownedTenants } } });
+    }
+  } finally {
+    if (prisma) await prisma.$disconnect();
+    if (mockGhServer) await new Promise<void>((resolve) => mockGhServer.close(() => resolve()));
+  }
 });
 
 function makeOrchestrator(extraConfig: Partial<{ owner: string; repo: string }> = {}): RemediationOrchestrator {

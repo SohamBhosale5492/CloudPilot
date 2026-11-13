@@ -128,6 +128,39 @@ test("configured execution deadline aborts orchestration", async () => {
   assert.equal((await worker.executeClaimedLease(lease)).kind, "manual_review");
 });
 
+test("explicit worker start reaps through the durable store, claims a lease, and invokes only artifact orchestration", async () => {
+  const observed: string[] = [];
+  let complete!: () => void;
+  const executionStarted = new Promise<void>((resolve) => { complete = resolve; });
+  let claimed = false;
+  const store = {
+    async reclaimExpiredLeases() { observed.push("reap"); },
+    async claimNextPending(workerId: string) {
+      observed.push(`claim:${workerId}`);
+      if (claimed) return null;
+      claimed = true;
+      return { ...lease, workerId };
+    },
+    async renewLease() { return true; }
+  };
+  const worker = new ArtifactOnlyRemediationWorker(store, {
+    async execute(received) { observed.push(`execute:${received.id}`); complete(); return published; }
+  }, { pollIntervalMs: 10, heartbeatIntervalMs: 20, leaseDurationMs: 100, executionTimeoutMs: 500 });
+
+  worker.start("demo-worker");
+  await Promise.race([executionStarted, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("worker did not claim")), 1_000))]);
+  await worker.stop();
+  assert.deepEqual(observed.slice(0, 3), ["reap", "claim:demo-worker", `execute:${lease.id}`]);
+  assert.equal(observed.some((value) => value.includes("legacy") || value.includes("failLease")), false);
+});
+
+test("worker cannot start without the durable claim and expiry lifecycle", () => {
+  const worker = new ArtifactOnlyRemediationWorker({ async renewLease() { return true; } }, {
+    async execute() { return published; }
+  });
+  assert.throws(() => worker.start("worker"), /Durable claim and expiry lifecycle/);
+});
+
 test("unexpected orchestrator exceptions propagate without legacy queue settlement", async () => {
   const error = new Error("orchestrator boundary failure");
   let calls = 0;
