@@ -1,0 +1,9 @@
+# CloudPilot Observability — Metrics Configuration
+# cloudpilot:metrics
+metrics:
+  - name: cloudpilot_pr_test_heartbeat_total
+    labels:
+      service: demo-service
+      route: /api/demo
+      method: GET
+    # cloudpilot:remediated:CP-RULE-OBS-GAP-METRIC-PRESENT
