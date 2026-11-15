@@ -150,6 +150,7 @@ test("approval atomically assigns only a same-tenant legacy project and writes a
   assert.equal(writes.length, 2);
   assert.deepEqual(writes[1], ["project", { where: { id: projectId, tenantId: tenant, organizationId: null }, data: { organizationId: org } }]);
   assert.equal(events.length, 1);
+  assert.deepEqual((events[0] as { select?: Record<string, unknown> }).select, { id: true });
   assert.deepEqual((events[0] as { data: Record<string, unknown> }).data, {
     organizationId: org, tenantId: tenant, projectId, adoptionId: "adoption", actorUserId: user,
     action: "PROJECT_ADOPTION_APPROVED", targetType: "project_organization_adoption", targetId: "adoption",
@@ -184,10 +185,89 @@ test("adoption request is scoped to verified tenant, requires an unowned legacy 
   assert.deepEqual(projectQuery[1], { where: { id: projectId, tenantId: tenant }, select: { id: true, organizationId: true } });
   const create = observed.find((item) => (item as unknown[])[0] === "create") as unknown[];
   const createData = (create[1] as { data: Record<string, unknown> }).data;
+  assert.deepEqual((create[1] as { select?: Record<string, unknown> }).select, { id: true, status: true, createdAt: true });
   assert.equal(createData.tenantId, tenant);
   assert.equal(createData.organizationId, org);
   assert.deepEqual(createData.provenance, { source: "authenticated-organization-project-adoption", tenantVerifiedByApi: true });
-  assert.equal(observed.filter((item) => (item as unknown[])[0] === "audit").length, 1);
+  const auditCalls = observed.filter((item) => (item as unknown[])[0] === "audit") as Array<[string, { select?: Record<string, unknown> }]>;
+  assert.equal(auditCalls.length, 1);
+  assert.deepEqual(auditCalls[0][1].select, { id: true });
+  assert.deepEqual((auditCalls[0][1] as unknown as { data: Record<string, unknown> }).data, {
+    organizationId: org,
+    actorUserId: user,
+    action: "PROJECT_ADOPTION_REQUESTED",
+    targetType: "project_organization_adoption",
+    targetId: "adoption",
+    metadata: { tenantId: tenant, projectId, adoptionId: "adoption", status: "pending" }
+  });
+});
+
+test("legacy project with organizationId=null satisfies org_audit_tenant_org_project_fkey and ck_org_audit_project_context across request and approval", async () => {
+  let projectOrgId: string | null = null;
+  let adoptionStatus = "pending";
+  const auditEvents: Array<Record<string, unknown>> = [];
+  const tx = {
+    organizationMember: { async findFirst() { return { role: "owner" }; } },
+    project: {
+      async findFirst() { return { id: projectId, organizationId: projectOrgId }; },
+      async updateMany(args: { where: { organizationId: string | null }; data: { organizationId: string } }) {
+        if (projectOrgId !== args.where.organizationId) return { count: 0 };
+        projectOrgId = args.data.organizationId;
+        return { count: 1 };
+      }
+    },
+    projectOrganizationAdoption: {
+      async findUnique() { return null; },
+      async findFirst() { return { id: "adoption-1", status: adoptionStatus }; },
+      async create() { return { id: "adoption-1", status: "pending", createdAt: new Date("2026-11-14T00:00:00Z") }; },
+      async updateMany(args: { data: { status: string } }) {
+        adoptionStatus = args.data.status;
+        return { count: 1 };
+      }
+    },
+    organizationAuditEvent: {
+      async create(args: { data: Record<string, unknown>; select?: Record<string, unknown> }) {
+        assert.deepEqual(args.select, { id: true });
+        const d = args.data;
+        const hasTenant = d.tenantId !== undefined && d.tenantId !== null;
+        const hasProject = d.projectId !== undefined && d.projectId !== null;
+        const hasAdoption = d.adoptionId !== undefined && d.adoptionId !== null;
+        // Enforce ck_org_audit_project_context
+        const validContext = (!hasTenant && !hasProject && !hasAdoption) || (hasTenant && hasProject);
+        assert.equal(validContext, true, "violated ck_org_audit_project_context");
+        // Enforce org_audit_tenant_org_project_fkey (MATCH SIMPLE)
+        if (hasTenant && hasProject && d.organizationId !== undefined && d.organizationId !== null) {
+          assert.equal(projectOrgId, d.organizationId, "violated org_audit_tenant_org_project_fkey");
+        }
+        auditEvents.push(d);
+        return { id: `audit-${auditEvents.length}` };
+      }
+    }
+  };
+  const prisma = { $transaction: async (callback: (tx: any) => Promise<unknown>) => callback(tx) } as unknown as PrismaClient;
+  const service = new PrismaProjectAdoptionService(prisma);
+
+  const requested = await service.request({
+    tenantId: tenant, organizationId: org, projectId, identityUserId: user, idempotencyKey: "adopt-legacy-1"
+  });
+  assert.equal(requested.replayed, false);
+  assert.equal(projectOrgId, null);
+  assert.equal(auditEvents.length, 1);
+  assert.equal(auditEvents[0]?.projectId, undefined);
+  assert.deepEqual(auditEvents[0]?.metadata, {
+    tenantId: tenant, projectId, adoptionId: "adoption-1", status: "pending"
+  });
+
+  const approved = await service.decide({
+    tenantId: tenant, organizationId: org, projectId, identityUserId: user,
+    idempotencyKey: "unused", adoptionId: "adoption-1", decision: "approve"
+  });
+  assert.deepEqual(approved, { id: "adoption-1", status: "approved" });
+  assert.equal(projectOrgId, org);
+  assert.equal(auditEvents.length, 2);
+  assert.equal(auditEvents[1]?.projectId, projectId);
+  assert.equal(auditEvents[1]?.tenantId, tenant);
+  assert.equal(auditEvents[1]?.adoptionId, "adoption-1");
 });
 
 test("rejection never changes legacy project ownership", async () => {

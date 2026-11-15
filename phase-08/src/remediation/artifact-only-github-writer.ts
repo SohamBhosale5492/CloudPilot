@@ -136,18 +136,25 @@ export class ArtifactOnlyGitHubWriter {
     }
     const client = this.capabilities.clientFor(input.capability);
     if (!client) return { kind: "failed", code: "invalid_trust_input" };
-    const expires = Math.min(Date.parse(input.capability.expiresAt), Date.parse(input.context.lease.expiresAt));
-    if (!Number.isFinite(expires) || expires <= this.now()) return { kind: "failed", code: "lease_lost" };
+    // The deadline is the capability service's latest validated, token-bounded lease expiry; it follows
+    // accepted heartbeat renewals and is never taken from caller-supplied lease fields.
+    const deadlinePassed = (): boolean => {
+      const deadline = this.capabilities.currentDeadlineFor(input.capability);
+      return deadline === null || !Number.isFinite(deadline) || deadline <= this.now();
+    };
+    if (deadlinePassed()) return { kind: "failed", code: "lease_lost" };
 
     const controller = new AbortController();
     const externalAbort = () => controller.abort();
     if (input.signal?.aborted) controller.abort();
     else input.signal?.addEventListener("abort", externalAbort, { once: true });
+    // Abort any in-flight request as soon as the capability is revoked or its latest deadline passes.
+    const stopDeadlineWatch = this.capabilities.watchDeadline(input.capability, () => controller.abort());
     const guard = async (): Promise<void> => {
       if (controller.signal.aborted) throw new WriterFailure("lease_lost");
       try { await input.leaseGuard.assertOwned(controller.signal); }
       catch { controller.abort(); throw new WriterFailure("lease_lost"); }
-      if (expires <= this.now()) { controller.abort(); throw new WriterFailure("lease_lost"); }
+      if (deadlinePassed()) { controller.abort(); throw new WriterFailure("lease_lost"); }
     };
 
     let mutationStarted: "blob" | "tree" | "commit" | undefined;
@@ -250,6 +257,7 @@ export class ArtifactOnlyGitHubWriter {
       mutationStarted = "tree";
       let tree;
       let treeResponse;
+      let verifiedTreeEntries: Map<string, GitHubTreeEntry> | undefined;
       const treeOperation = internalMutationBoundary<import("../github/artifact-only-github-client.js").GitHubTree,
         import("../github/artifact-only-github-client.js").GitHubTree>({
         stage: "tree",
@@ -272,6 +280,7 @@ export class ArtifactOnlyGitHubWriter {
           if (!exactSingleFileDelta(baseEntries, entries, input.context.filePath, input.context.operation, expectedBlobSha)) {
             throw new WriterFailure("post_write_verification_failed");
           }
+          verifiedTreeEntries = entries;
           return response;
         }
       });
@@ -317,11 +326,10 @@ export class ArtifactOnlyGitHubWriter {
             const readBack = await client.readCommit(repository, response.sha, controller.signal);
             if (readBack.sha !== response.sha || readBack.treeSha !== tree.sha || readBack.parentShas.length !== 1 ||
                 readBack.parentShas[0] !== baseCommit.sha) throw new WriterFailure("post_write_verification_failed");
-            const entries = await flattenTree(client, repository, readBack.treeSha, controller.signal);
-            if (!exactSingleFileDelta(baseEntries, entries, input.context.filePath, input.context.operation, expectedBlobSha)) {
-              throw new WriterFailure("post_write_verification_failed");
-            }
-            const finalEntry = entries.get(input.context.filePath);
+            // treeOperation.verify already flattened and validated exactSingleFileDelta for tree.sha.
+            // Because Git trees are content-addressed, readBack.treeSha === tree.sha proves the same tree.
+            if (!verifiedTreeEntries) throw new WriterFailure("post_write_verification_failed");
+            const finalEntry = verifiedTreeEntries.get(input.context.filePath);
             if (!finalEntry || finalEntry.sha !== expectedBlobSha || finalEntry.mode !== "100644" || finalEntry.type !== "blob") {
               throw new WriterFailure("post_write_verification_failed");
             }
@@ -384,11 +392,16 @@ export class ArtifactOnlyGitHubWriter {
         return { kind: "failed", code: "rate_limited", ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
           ...(error.rejectionEvidence ? { rejectionEvidence: error.rejectionEvidence } : {}) };
       }
+      if (error instanceof ArtifactGitHubClientError && error.code === "invalid_token") {
+        if (remoteMutationCompleted) return { kind: "manual_review", code: "lease_lost_after_write" };
+        if (!mutationStarted) return { kind: "failed", code: "lease_lost" };
+      }
       if (mutationStarted === "blob") return { kind: "manual_review", code: "ambiguous_blob_write" };
       if (mutationStarted === "tree") return { kind: "manual_review", code: "ambiguous_tree_write" };
       if (mutationStarted === "commit") return { kind: "manual_review", code: "ambiguous_commit_write" };
       return { kind: "failed", code: "github_read_failed" };
     } finally {
+      stopDeadlineWatch();
       input.signal?.removeEventListener("abort", externalAbort);
     }
   }

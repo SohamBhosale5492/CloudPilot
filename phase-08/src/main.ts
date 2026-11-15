@@ -81,8 +81,16 @@ export async function main(env: ProductionEnvironment = process.env as Productio
   });
   try {
     await host.start();
-  } catch {
-    process.stderr.write("CloudPilot startup failed; verify runtime configuration, database schema, and service availability.\n");
+  } catch (error) {
+    const diagnosticMessage = (message: string): string => message
+      .replace(/\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?):\/\/[^\s"'<>]+/gi, "[redacted connection URL]")
+      .replace(/\b(DATABASE_URL|MIGRATION_DATABASE_URL|GITHUB_APP_PRIVATE_KEY)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+      .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[redacted private key]");
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`CloudPilot startup failed: ${diagnosticMessage(message)}\n`);
+    if (error instanceof Error && error.cause instanceof Error) {
+      process.stderr.write(`CloudPilot startup cause: ${diagnosticMessage(error.cause.message)}\n`);
+    }
     process.exitCode = 1;
     return;
   }

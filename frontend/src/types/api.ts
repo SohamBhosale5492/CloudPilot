@@ -112,6 +112,14 @@ export interface RemediationProposal {
   plan: unknown;
   approvalState: ProposalApprovalState;
   status: string;
+  prDeliveryStatus?: string;
+  findingResolution?: {
+    status: "resolved" | "unresolved" | "unverified";
+    resolvedScanId: string | null;
+    latestScanId: string | null;
+    latestOutcome: string | null;
+    verifiedAt: string | null;
+  };
   approvedByIdentityUserId: string | null;
   approvedAt: string | null;
   rejectedByIdentityUserId: string | null;
@@ -119,10 +127,19 @@ export interface RemediationProposal {
   executionArtifact: { artifactHash: string; filePath: string; baseRef: string; baseCommitSha: string } | null;
   approvedArtifactHash: string | null;
   invalidatedAt: string | null;
+  invalidationReason?: string | null;
   createdAt: string;
   permissions?: { prepareArtifact: boolean; approve: boolean };
   execution?: null | {
-    status: string; stage: string | null; attemptNumber: number; commitSha: string | null; branchName: string | null;
+    status: string;
+  prDeliveryStatus?: string;
+  findingResolution?: {
+    status: "resolved" | "unresolved" | "unverified";
+    resolvedScanId: string | null;
+    latestScanId: string | null;
+    latestOutcome: string | null;
+    verifiedAt: string | null;
+  }; stage: string | null; attemptNumber: number; commitSha: string | null; branchName: string | null;
     pullRequestNumber: number | null; pullRequestUrl: string | null; failureCode: string | null; updatedAt: string;
   };
 }

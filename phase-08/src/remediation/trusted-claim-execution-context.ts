@@ -3,7 +3,13 @@ import type { RemediationLease } from "../jobs/remediation-repo.js";
 import { hasOrganizationPermission } from "../organizations/permissions.js";
 import { verifyPlanSnapshotIntegrity } from "../api/remediation-proposal-repo.js";
 import { verifyExecutionArtifact, type RemediationExecutionArtifact } from "./execution-artifact.js";
-import { lockActiveBindingInstallation, lockActiveMember, lockActiveOrganization, lockScopedFinding } from "./postgres-lock-helpers.js";
+import {
+  lockActiveBindingInstallation,
+  lockActiveMember,
+  lockActiveOrganization,
+  lockScopedFinding,
+  withSerializationRetry
+} from "./postgres-lock-helpers.js";
 
 const contextBrand: unique symbol = Symbol("TrustedClaimExecutionContext");
 const trustedContexts = new WeakSet<object>();
@@ -94,8 +100,8 @@ class PrismaTrustedClaimExecutionContextRepository implements TrustedClaimExecut
   constructor(private readonly prisma: PrismaClient) {}
 
   withLockedClaim<T>(lease: RemediationLease, build: (state: PersistedClaimState) => T | null): Promise<T | null> {
-    return this.prisma.$transaction((tx) => this.withLockedClaimInTransaction(tx, lease, build),
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    return withSerializationRetry(() => this.prisma.$transaction((tx) => this.withLockedClaimInTransaction(tx, lease, build), { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
+
   }
 
   withLockedClaimInTransaction<T>(tx: Prisma.TransactionClient, lease: RemediationLease,

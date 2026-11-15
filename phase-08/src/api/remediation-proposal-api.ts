@@ -12,6 +12,26 @@ function decodePathId(value: string): string | null {
   try { return decodeURIComponent(value); } catch { return null; }
 }
 
+function readPageOptions(context: AuthenticatedRouteContext): { limit: number; cursor?: string } | null {
+  const limits = context.url.searchParams.getAll("limit");
+  const cursors = context.url.searchParams.getAll("cursor");
+  if (limits.length > 1 || cursors.length > 1) return null;
+
+  let limit = 20;
+  if (limits.length === 1) {
+    if (!/^(?:[1-9]\d*)$/.test(limits[0])) return null;
+    limit = Number(limits[0]);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return null;
+  }
+
+  let cursor: string | undefined;
+  if (cursors.length === 1) {
+    cursor = cursors[0];
+    if (!cursor || !UUID.test(cursor)) return null;
+  }
+  return { limit, ...(cursor ? { cursor } : {}) };
+}
+
 export interface RemediationProposalApiOptions {
   expectedIssuer: string;
 }
@@ -34,6 +54,42 @@ export class RemediationProposalApiRoutes implements AuthenticatedRouteExtension
   ) {}
 
   async handle(context: AuthenticatedRouteContext): Promise<boolean> {
+    const projectProposals = context.pathname.match(/^\/api\/v1\/projects\/([^/]+)\/remediation-proposals$/);
+    if (projectProposals && context.method === "GET") {
+      const projectId = decodePathId(projectProposals[1]);
+      if (!projectId || !UUID.test(projectId)) {
+        context.sendJson(400, { error: "Invalid project ID." });
+        return true;
+      }
+      if (!hasPermission(context.identity, "remediation:read")) {
+        context.sendJson(403, { error: "Forbidden: insufficient permissions." });
+        return true;
+      }
+      const options = readPageOptions(context);
+      if (!options) {
+        context.sendJson(400, { error: "Invalid limit or cursor." });
+        return true;
+      }
+      try {
+        const localUser = await this.resolveIdentity(context);
+        const page = await this.proposals.listByProject({
+          tenantId: context.identity.tenantId,
+          projectId,
+          identityUserId: localUser.id,
+          limit: options.limit,
+          cursor: options.cursor
+        });
+        context.sendJson(200, {
+          items: page.items,
+          nextCursor: page.nextCursor,
+          hasMore: page.hasMore
+        });
+      } catch (error) {
+        if (!sendKnownError(context, error)) throw error;
+      }
+      return true;
+    }
+
     const create = context.pathname.match(/^\/api\/v1\/projects\/([^/]+)\/remediation-proposals$/);
     if (create && context.method === "POST") {
       const projectId = decodePathId(create[1]);

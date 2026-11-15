@@ -95,6 +95,14 @@ test("PostgreSQL runtime role is restricted while migration role remains isolate
         has_table_privilege(current_user, 'public.audit_events', 'TRUNCATE') AS audit_truncate,
         has_table_privilege(current_user, 'public.organization_audit_events', 'INSERT') AS org_audit_insert,
         has_table_privilege(current_user, 'public.organization_audit_events', 'SELECT') AS org_audit_select,
+        has_column_privilege(current_user, 'public.organization_audit_events', 'id', 'SELECT') AS org_audit_id_select,
+        has_column_privilege(current_user, 'public.organization_audit_events', 'metadata', 'SELECT') AS org_audit_metadata_select,
+        NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_attribute AS a
+          WHERE a.attrelid = 'public.organization_audit_events'::regclass
+            AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> 'id'
+            AND has_column_privilege(current_user, 'public.organization_audit_events', a.attname::text, 'SELECT')
+        ) AS org_audit_other_columns_denied,
         has_table_privilege(current_user, 'public.organization_audit_events', 'UPDATE') AS org_audit_update,
         has_table_privilege(current_user, 'public.organization_audit_events', 'DELETE') AS org_audit_delete,
         has_table_privilege(current_user, 'public.organization_audit_events', 'TRUNCATE') AS org_audit_truncate,
@@ -109,10 +117,11 @@ test("PostgreSQL runtime role is restricted while migration role remains isolate
     `;
     const p = permissions[0]!;
     for (const key of ["finding_update", "organization_update", "member_update", "installation_update", "event_update", "event_delete", "event_truncate",
-      "audit_update", "audit_delete", "audit_truncate", "org_audit_select", "org_audit_update", "org_audit_delete", "org_audit_truncate",
+      "audit_update", "audit_delete", "audit_truncate", "org_audit_select", "org_audit_metadata_select", "org_audit_update", "org_audit_delete", "org_audit_truncate",
       "tenant_select", "legacy_user_select", "webhook_select", "migration_select", "migration_insert", "migration_update",
       "migration_delete", "migration_truncate"]) assert.equal(p[key], false, `${key} must be denied`);
-    for (const key of ["event_select", "event_insert", "audit_select", "audit_insert", "org_audit_insert"]) assert.equal(p[key], true, `${key} must be allowed`);
+    assert.equal(p.org_audit_other_columns_denied, true, "only the organization audit event ID column may be selected");
+    for (const key of ["event_select", "event_insert", "audit_select", "audit_insert", "org_audit_insert", "org_audit_id_select"]) assert.equal(p[key], true, `${key} must be allowed`);
     assert.equal(p.project_delete, true, "authorized project deletion remains supported");
     assert.equal(p.project_insert, true, "Phase 06 project creation remains supported");
     assert.equal(p.finding_delete, true, "scan retry can remove partial findings");

@@ -40,6 +40,8 @@ import {
   isRemediationSupported,
   buildIdempotencyKey,
   patchObservabilityYaml,
+  patchPrometheusAlertRulesYaml,
+  validatePrometheusAlertRulesYaml,
   UnsupportedFindingError,
   MalformedYamlError,
   UnsupportedYamlStructureError,
@@ -378,7 +380,7 @@ test("planRemediation: non-gap outcome throws UnsupportedFindingError", () => {
 
 test("planRemediation: unsupported signal throws UnsupportedFindingError", () => {
   assert.throws(
-    () => planRemediation(makeGapFinding({ signal: "trace" })),
+    () => planRemediation(makeGapFinding({ signal: "log" })),
     UnsupportedFindingError
   );
   assert.throws(
@@ -400,7 +402,7 @@ test("isRemediationSupported: false for non-gap outcome", () => {
 });
 
 test("isRemediationSupported: false for unsupported signals", () => {
-  assert.equal(isRemediationSupported("trace", "gap"), false);
+  assert.equal(isRemediationSupported("trace", "gap"), true);
   assert.equal(isRemediationSupported("log", "gap"), false);
 });
 
@@ -464,10 +466,10 @@ test("RemediationOrchestrator: skips unsupported signal (trace)", async () => {
   );
   const result = await orch.remediateOne(
     "tenant-1", "proj-1", "scan-1", "finding-1",
-    makeGapFinding({ signal: "trace" })
+    makeGapFinding({ signal: "log" })
   );
   assert.equal(result.skipped, true);
-  assert.ok(result.skipReason?.includes("trace"));
+  assert.ok(result.skipReason?.includes("log"));
 });
 
 test("RemediationOrchestrator: skips non-gap outcome (pass)", async () => {
@@ -725,7 +727,7 @@ test("RemediationOrchestrator: remediateScan processes multiple findings", async
   const findings = [
     { id: "f1", summary: makeGapFinding({ signal: "metric",  requirementId: "req-1", ruleId: "rule.1" }) },
     { id: "f2", summary: makeGapFinding({ signal: "health",  requirementId: "req-2", ruleId: "rule.2" }) },
-    { id: "f3", summary: makeGapFinding({ signal: "trace",   requirementId: "req-3", ruleId: "rule.3" }) }, // skipped
+    { id: "f3", summary: makeGapFinding({ signal: "log",     requirementId: "req-3", ruleId: "rule.3" }) }, // skipped
     { id: "f4", summary: makeGapFinding({ signal: "metric",  requirementId: "req-4", ruleId: "rule.4", outcome: "pass" }) } // skipped
   ];
 
@@ -1002,4 +1004,532 @@ test("RemediationRepository: throws InvalidCursorError when cursor does not exis
     () => repo.listByProject("tenant-a", "proj-a", { cursor: "invalid-cursor-id" }),
     InvalidCursorError
   );
+});
+
+
+// ─── 10. Structured Metric Evidence & Label Selector Remediation ─────────────
+
+test("planRemediation: CP-RULE-OBS-GAP-METRIC-PRESENT derives demo_http_server_requests_total and all three required labels instead of requirementId", () => {
+  const finding = makeGapFinding({
+    requirementId: "demo-request-metric",
+    ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+    ruleVersion: "1.0.0",
+    signal: "metric",
+    outcome: "gap",
+    expected: "demo_http_server_requests_total for service=demo-service, route=/api/demo, method=GET with value >= 1",
+    observed: "0 matching series in fresh Prometheus evidence (1 total samples)",
+    reason: "Metric demo_http_server_requests_total did not meet minimum count 1 (observed 0).",
+    evidenceJson: {
+      evidence: {
+        data: {
+          source: "prometheus",
+          samples: [
+            {
+              metricName: "demo_http_server_requests_total",
+              labels: {
+                serviceName: "demo-service",
+                route: "/api/demo",
+                method: "GET",
+                statusCode: "200"
+              },
+              value: 0
+            }
+          ]
+        }
+      }
+    }
+  });
+
+  const patch = planRemediation(finding);
+  assert.equal(patch.filePath, "config/observability/metrics.yaml");
+  assert.equal(patch.prTitle, "fix(observability): add missing metric 'demo_http_server_requests_total'");
+  assert.equal(patch.commitMessage, "fix(metrics): add demo_http_server_requests_total — demo-request-metric");
+  assert.equal(
+    patch.summary,
+    "Add metric 'demo_http_server_requests_total' (service=demo-service, route=/api/demo, method=GET) to metrics.yaml"
+  );
+  assert.ok(!patch.prTitle.includes("demo_request_metric"));
+
+  const rendered = patch.applyPatch(patch.initialFileContent);
+  const expectedYaml = [
+    "# CloudPilot Observability — Metrics Configuration",
+    "# cloudpilot:metrics",
+    "metrics:",
+    "  - name: demo_http_server_requests_total",
+    "    labels:",
+    "      service: demo-service",
+    "      route: /api/demo",
+    "      method: GET",
+    "    # cloudpilot:remediated:CP-RULE-OBS-GAP-METRIC-PRESENT",
+    ""
+  ].join("\n");
+
+  assert.equal(rendered, expectedYaml);
+  assert.equal(patch.applyPatch(rendered), rendered, "Applying metric patch twice must be idempotent");
+});
+
+test("planRemediation: derives metric name and required labels from structured evidenceJson when expected is empty", () => {
+  const finding = makeGapFinding({
+    requirementId: "demo-request-metric",
+    ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+    ruleVersion: "1.0.0",
+    signal: "metric",
+    outcome: "gap",
+    expected: "",
+    observed: "0",
+    reason: "Missing request metric",
+    evidenceJson: {
+      evidence: {
+        data: {
+          source: "prometheus",
+          samples: [
+            {
+              metricName: "demo_http_server_requests_total",
+              labels: {
+                serviceName: "demo-service",
+                route: "/api/demo",
+                method: "GET"
+              },
+              value: 0
+            }
+          ]
+        }
+      }
+    }
+  });
+
+  const patch = planRemediation(finding);
+  const rendered = patch.applyPatch(patch.initialFileContent);
+  assert.ok(rendered.includes("name: demo_http_server_requests_total"));
+  assert.ok(rendered.includes("service: demo-service"));
+  assert.ok(rendered.includes("route: /api/demo"));
+  assert.ok(rendered.includes("method: GET"));
+});
+
+test("planRemediation: rejects missing metric or label evidence for CP-RULE-OBS-GAP-METRIC-PRESENT without falling back to requirementId", () => {
+  // Unstructured expected string with no evidenceJson must not fall back to requirementId
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "minimumCount >= 1"
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Invalid requirement fallback message from evaluation.ts
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "Valid request metric requirement with non-empty id, serviceName, metricName and route."
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Missing service label
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for route=/api/demo, method=GET with value >= 1"
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Missing route label
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service=demo-service, method=GET with value >= 1"
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Missing method label on request metric
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service=demo-service, route=/api/demo with value >= 1"
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Empty samples in evidenceJson and empty expected
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "",
+          evidenceJson: { evidence: { data: { source: "prometheus", samples: [] } } }
+        })
+      ),
+    UnsupportedFindingError
+  );
+});
+
+test("planRemediation: rejects ambiguous or conflicting metric evidence", () => {
+  // Conflict between expected metricName and evidenceJson sample metricName
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service=demo-service, route=/api/demo, method=GET with value >= 1",
+          evidenceJson: {
+            evidence: {
+              data: {
+                samples: [
+                  {
+                    metricName: "other_http_requests_total",
+                    labels: { serviceName: "demo-service", route: "/api/demo", method: "GET" },
+                    value: 0
+                  }
+                ]
+              }
+            }
+          }
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Conflict between expected route/method and evidenceJson sample labels
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service=demo-service, route=/api/demo, method=GET with value >= 1",
+          evidenceJson: {
+            evidence: {
+              data: {
+                samples: [
+                  {
+                    metricName: "demo_http_server_requests_total",
+                    labels: { serviceName: "demo-service", route: "/api/other", method: "GET" },
+                    value: 0
+                  }
+                ]
+              }
+            }
+          }
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Ambiguous evidence samples with multiple distinct routes/metrics
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "",
+          evidenceJson: {
+            evidence: {
+              data: {
+                samples: [
+                  {
+                    metricName: "demo_http_server_requests_total",
+                    labels: { serviceName: "demo-service", route: "/api/demo", method: "GET" },
+                    value: 0
+                  },
+                  {
+                    metricName: "demo_http_server_requests_total",
+                    labels: { serviceName: "demo-service", route: "/api/admin", method: "POST" },
+                    value: 0
+                  }
+                ]
+              }
+            }
+          }
+        })
+      ),
+    UnsupportedFindingError
+  );
+
+  // Duplicate label keys in expected string
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service=demo-service, service=alt-service, route=/api/demo, method=GET with value >= 1"
+        })
+      ),
+    UnsupportedFindingError
+  );
+});
+
+test("planRemediation: accepts service_name alias in expected selectors and evidenceJson and normalizes to labels.service", () => {
+  const fromExpected = planRemediation(
+    makeGapFinding({
+      requirementId: "demo-request-metric",
+      ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+      expected: "demo_http_server_requests_total for service_name=demo-service, route=/api/demo, method=GET with value >= 1"
+    })
+  );
+  assert.equal(
+    fromExpected.summary,
+    "Add metric 'demo_http_server_requests_total' (service=demo-service, route=/api/demo, method=GET) to metrics.yaml"
+  );
+  const renderedFromExpected = fromExpected.applyPatch(fromExpected.initialFileContent);
+  assert.ok(renderedFromExpected.includes("      service: demo-service\n"));
+  assert.ok(!renderedFromExpected.includes("service_name:"));
+
+  const fromEvidence = planRemediation(
+    makeGapFinding({
+      requirementId: "demo-request-metric",
+      ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+      expected: "",
+      evidenceJson: {
+        evidence: {
+          data: {
+            source: "prometheus",
+            samples: [
+              {
+                metricName: "demo_http_server_requests_total",
+                labels: {
+                  service_name: "demo-service",
+                  route: "/api/demo",
+                  method: "GET"
+                },
+                value: 0
+              }
+            ]
+          }
+        }
+      }
+    })
+  );
+  assert.equal(fromEvidence.applyPatch(fromEvidence.initialFileContent), renderedFromExpected);
+
+  const fromRootEvidence = planRemediation(
+    makeGapFinding({
+      requirementId: "demo-request-metric",
+      ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+      expected: "",
+      evidenceJson: {
+        metricName: "demo_http_server_requests_total",
+        service_name: "demo-service",
+        route: "/api/demo",
+        method: "GET"
+      }
+    })
+  );
+  assert.equal(fromRootEvidence.applyPatch(fromRootEvidence.initialFileContent), renderedFromExpected);
+});
+
+test("planRemediation: accepts matching service aliases across expected selectors and evidenceJson", () => {
+  const patch = planRemediation(
+    makeGapFinding({
+      requirementId: "demo-request-metric",
+      ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+      expected:
+        "demo_http_server_requests_total for service=demo-service, service_name=demo-service, route=/api/demo, method=GET with value >= 1",
+      evidenceJson: {
+        evidence: {
+          data: {
+            source: "prometheus",
+            samples: [
+              {
+                metricName: "demo_http_server_requests_total",
+                labels: {
+                  exported_job: "demo-service",
+                  serviceName: "demo-service",
+                  service_name: "demo-service",
+                  route: "/api/demo",
+                  method: "GET"
+                },
+                value: 0
+              }
+            ]
+          }
+        }
+      }
+    })
+  );
+  const rendered = patch.applyPatch(patch.initialFileContent);
+  assert.ok(rendered.includes("      service: demo-service\n"));
+  assert.equal(patch.applyPatch(rendered), rendered);
+});
+
+test("planRemediation: rejects conflicting service aliases and unknown selector keys", () => {
+  for (const expected of [
+    "demo_http_server_requests_total for service=demo-service, service_name=other-service, route=/api/demo, method=GET with value >= 1",
+    "demo_http_server_requests_total for service_name=other-service, service=demo-service, route=/api/demo, method=GET with value >= 1",
+    "demo_http_server_requests_total for service_name=demo-service",
+    "demo_http_server_requests_total for service_name=demo-service, pod_name=demo-pod, route=/api/demo, method=GET with value >= 1"
+  ]) {
+    assert.throws(
+      () =>
+        planRemediation(
+          makeGapFinding({
+            requirementId: "demo-request-metric",
+            ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+            expected
+          })
+        ),
+      UnsupportedFindingError
+    );
+  }
+
+  for (const conflictingLabels of [
+    { exported_job: "demo-service", service_name: "other-service" },
+    { service: "demo-service", service_name: "other-service" },
+    { serviceName: "demo-service", service_name: "other-service" },
+    { serviceName: "demo-service", exported_job: "other-service" },
+    { exported_job: "demo-service", service_name: "" }
+  ]) {
+    assert.throws(
+      () =>
+        planRemediation(
+          makeGapFinding({
+            requirementId: "demo-request-metric",
+            ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+            expected: "",
+            evidenceJson: {
+              evidence: {
+                data: {
+                  samples: [
+                    {
+                      metricName: "demo_http_server_requests_total",
+                      labels: {
+                        ...conflictingLabels,
+                        route: "/api/demo",
+                        method: "GET"
+                      },
+                      value: 0
+                    }
+                  ]
+                }
+              }
+            }
+          })
+        ),
+      UnsupportedFindingError
+    );
+  }
+
+  assert.throws(
+    () =>
+      planRemediation(
+        makeGapFinding({
+          requirementId: "demo-request-metric",
+          ruleId: "CP-RULE-OBS-GAP-METRIC-PRESENT",
+          expected: "demo_http_server_requests_total for service_name=demo-service, route=/api/demo, method=GET with value >= 1",
+          evidenceJson: {
+            evidence: {
+              data: {
+                samples: [
+                  {
+                    metricName: "demo_http_server_requests_total",
+                    labels: {
+                      exported_job: "other-service",
+                      route: "/api/demo",
+                      method: "GET"
+                    },
+                    value: 0
+                  }
+                ]
+              }
+            }
+          }
+        })
+      ),
+    UnsupportedFindingError
+  );
+});
+
+test("planRemediation: alert gap produces valid Prometheus groups[].rules[] YAML and is idempotent", () => {
+  const patch = planRemediation(
+    makeGapFinding({
+      signal: "alert",
+      requirementId: "demo-heartbeat-alert",
+      expected: "alert rule demo_heartbeat_alert loaded in prometheus"
+    })
+  );
+
+  assert.equal(patch.filePath, "config/observability/alert-rules.yaml");
+  const once = patch.applyPatch(patch.initialFileContent);
+  assert.ok(once.includes("groups:"));
+  assert.ok(once.includes("name: cloudpilot_alerts"));
+  assert.ok(once.includes("alert: demo_heartbeat_alert"));
+  assert.ok(once.includes("expr:"));
+  assert.doesNotThrow(() => validatePrometheusAlertRulesYaml(once));
+
+  const twice = patch.applyPatch(once);
+  assert.equal(twice, once);
+});
+
+test("validatePrometheusAlertRulesYaml rejects malformed, missing groups, invalid alert name, and empty expr", () => {
+  assert.throws(() => validatePrometheusAlertRulesYaml("not: [valid: yaml"), MalformedYamlError);
+  assert.throws(() => validatePrometheusAlertRulesYaml("alerts: []\n"), UnsupportedYamlStructureError);
+  assert.throws(
+    () =>
+      validatePrometheusAlertRulesYaml(
+        "groups:\n  - name: cloudpilot_alerts\n    rules:\n      - alert: bad-name!\n        expr: up == 0\n"
+      ),
+    UnsupportedYamlStructureError
+  );
+  assert.throws(
+    () =>
+      validatePrometheusAlertRulesYaml(
+        "groups:\n  - name: cloudpilot_alerts\n    rules:\n      - alert: valid_alert\n        expr: \"\"\n"
+      ),
+    UnsupportedYamlStructureError
+  );
+  assert.throws(
+    () =>
+      patchPrometheusAlertRulesYaml("alerts: []\n", {
+        alert: "valid_alert",
+        expr: "up == 0",
+        severity: "warning",
+        requirementId: "valid_alert",
+        summary: "Test alert"
+      }),
+    UnsupportedYamlStructureError
+  );
+});
+
+test("planRemediation: trace gap produces valid config/observability/tracing.yaml patch and is idempotent", () => {
+  const patch = planRemediation(
+    makeGapFinding({
+      signal: "trace",
+      requirementId: "demo-traces",
+      expected: "Jaeger contains at least one recent trace for service 'demo-service'."
+    })
+  );
+  assert.equal(patch.filePath, "config/observability/tracing.yaml");
+  const once = patch.applyPatch(patch.initialFileContent);
+  assert.ok(once.includes("enabled: true"));
+  assert.ok(once.includes("tracecontext"));
+  assert.ok(once.includes("baggage"));
+  assert.ok(once.includes("demo-service"));
+  const twice = patch.applyPatch(once);
+  assert.equal(twice, once);
 });

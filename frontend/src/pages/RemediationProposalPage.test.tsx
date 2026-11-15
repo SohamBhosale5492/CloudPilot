@@ -26,6 +26,24 @@ describe("RemediationProposalPage", () => {
     api.decideRemediationProposal.mockReset().mockResolvedValue({ remediationId: "proposal-1", approvalState: "approved", status: "pending_approval" });
   });
 
+  it("displays invalidated status and reason and omits approval buttons for stale proposals", async () => {
+    api.getRemediationProposal.mockResolvedValue({
+      ...pending(false),
+      approvalState: "invalidated",
+      invalidatedAt: "2026-01-02T00:00:00Z",
+      invalidationReason: "The original finding was resolved in a newer completed scan."
+    });
+    render(<MemoryRouter initialEntries={["/proposals/proposal-1"]}><Routes>
+      <Route path="/proposals/:proposalId" element={<RemediationProposalPage />} />
+    </Routes></MemoryRouter>);
+
+    expect(await screen.findByText(/Proposal invalidated\./)).toBeInTheDocument();
+    expect(screen.getByText(/The original finding was resolved in a newer completed scan\./)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve proposal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reject proposal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Prepare verified artifact" })).not.toBeInTheDocument();
+  });
+
   it("prepares and displays the persisted artifact before explicit approval", async () => {
     api.getRemediationProposal.mockResolvedValueOnce(pending(false)).mockResolvedValueOnce(pending(true)).mockResolvedValueOnce({
       ...pending(true), approvalState: "approved", approvedArtifactHash: "b".repeat(64)

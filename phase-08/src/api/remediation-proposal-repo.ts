@@ -16,7 +16,20 @@ export interface CreateRemediationProposalInput {
 export interface RemediationProposalDecisionInput {
   tenantId: string; remediationId: string; identityUserId: string; decision: "approve" | "reject";
 }
+export interface RemediationProposalListInput {
+  tenantId: string;
+  projectId: string;
+  identityUserId: string;
+  limit: number;
+  cursor?: string;
+}
+export interface RemediationProposalPage {
+  items: Record<string, unknown>[];
+  nextCursor?: string;
+  hasMore: boolean;
+}
 export interface RemediationProposalStore {
+  listByProject(input: RemediationProposalListInput): Promise<RemediationProposalPage>;
   create(input: CreateRemediationProposalInput): Promise<{ proposal: Record<string, unknown>; replayed: boolean }>;
   read(input: { tenantId: string; remediationId: string; identityUserId: string }): Promise<Record<string, unknown>>;
   decide(input: RemediationProposalDecisionInput): Promise<
@@ -25,7 +38,19 @@ export interface RemediationProposalStore {
   >;
 }
 
-interface ProposalFinding extends FindingSummary { id: string; scanId: string; }
+interface ProposalFinding extends FindingSummary {
+  id: string;
+  scanId: string;
+  organizationId?: string | null;
+  attemptNumber?: number;
+  evidenceJson?: Prisma.JsonValue;
+  createdAt?: Date;
+}
+
+function deterministicAdoptionUuid(scope: string): string {
+  const hex = createHash("sha256").update(scope, "utf8").digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 interface ProposalBinding {
   id: string; githubRepositoryId: bigint; installationRecordId: string; ownerLogin: string; repositoryName: string;
   installation: { status: string };
@@ -177,13 +202,39 @@ function assertArtifactIntegrity(row: ProposalRow): RemediationExecutionArtifact
   return row.execution_artifact as unknown as RemediationExecutionArtifact;
 }
 
+function derivePrDeliveryStatus(status: string, executionStatus?: string | null): string {
+  if (status === "merged") return "pr_merged";
+  if (status === "closed") return "pr_closed";
+  if (status === "open" || executionStatus === "completed") return "draft_pr_created";
+  if (status === "failed" || executionStatus === "failed" || executionStatus === "manual_review") return "failed";
+  if (status === "executing" || status === "queued" || executionStatus === "running" || executionStatus === "leased" || executionStatus === "queued") return "in_progress";
+  return "not_started";
+}
+
+function deriveFindingResolution(latest: { scanId: string; outcome: string; completedAt: Date | null } | null): {
+  status: "resolved" | "unresolved" | "unverified";
+  resolvedScanId: string | null;
+  latestScanId: string | null;
+  latestOutcome: string | null;
+  verifiedAt: string | null;
+} {
+  if (!latest) {
+    return { status: "unverified", resolvedScanId: null, latestScanId: null, latestOutcome: null, verifiedAt: null };
+  }
+  const verifiedAt = latest.completedAt ? latest.completedAt.toISOString() : null;
+  if (latest.outcome === "pass") {
+    return { status: "resolved", resolvedScanId: latest.scanId, latestScanId: latest.scanId, latestOutcome: latest.outcome, verifiedAt };
+  }
+  return { status: "unresolved", resolvedScanId: null, latestScanId: latest.scanId, latestOutcome: latest.outcome, verifiedAt };
+}
+
 function publicProposal(row: ProposalRow): Record<string, unknown> {
   const artifact = assertArtifactIntegrity(row);
   return {
     id: row.id, organizationId: row.organization_id, projectId: row.project_id, findingId: row.finding_id,
     requestedByIdentityUserId: row.requested_by_identity_user_id, repositoryBindingId: row.repository_binding_id,
     githubRepositoryId: row.github_repository_id.toString(), planHash: row.plan_hash, plan: row.plan_snapshot,
-    approvalState: row.approval_state, status: row.status, approvedByIdentityUserId: row.approved_by_identity_user_id,
+    approvalState: row.approval_state, status: row.status, prDeliveryStatus: derivePrDeliveryStatus(row.status), approvedByIdentityUserId: row.approved_by_identity_user_id,
     approvedAt: row.approved_at?.toISOString() ?? null, rejectedByIdentityUserId: row.rejected_by_identity_user_id,
     executionArtifact: artifact ? executionArtifactMetadata(artifact, row.execution_artifact_hash!) : null,
     approvedArtifactHash: row.approved_artifact_hash,
@@ -199,14 +250,14 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
   ) {}
 
   async create(input: CreateRemediationProposalInput): Promise<{ proposal: Record<string, unknown>; replayed: boolean }> {
-    let conflictIdentity: { key: string; hash: string; binding: string; repositoryId: bigint; organizationId: string } | null = null;
+    let conflictIdentity: { key: string; hash: string; binding: string; repositoryId: bigint; organizationId: string; findingId: string } | null = null;
     try {
       return await this.prisma.$transaction(async (tx) => {
-        const context = await this.loadContext(tx, input.tenantId, input.projectId, input.findingId, input.requesterIdentityUserId, "remediation:create");
+        const context = await this.loadContext(tx, input.tenantId, input.projectId, input.findingId, input.requesterIdentityUserId, "remediation:create", { adoptPreAdoptionFinding: true });
         const snapshot = makePlanSnapshot(context.project.id, context.finding, context.binding);
         const planHash = hashPlan(snapshot);
         const idempotencyKey = buildIdempotencyKey(input.tenantId, context.finding.id, context.finding.ruleId, context.finding.ruleVersion);
-        conflictIdentity = { key: idempotencyKey, hash: planHash, binding: context.binding.id, repositoryId: context.binding.githubRepositoryId, organizationId: context.project.organizationId! };
+        conflictIdentity = { key: idempotencyKey, hash: planHash, binding: context.binding.id, repositoryId: context.binding.githubRepositoryId, organizationId: context.project.organizationId!, findingId: context.finding.id };
         const prior = await tx.$queryRaw<ProposalRow[]>`SELECT ${Prisma.raw(RETURNING_PROPOSAL)} FROM remediations WHERE idempotency_key = ${idempotencyKey} LIMIT 1`;
         if (prior[0]) return this.replayOrConflict(prior[0], input, context, planHash);
 
@@ -217,8 +268,8 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
             retries_left, requested_by_identity_user_id, repository_binding_id, github_repository_id,
             plan_hash, plan_snapshot, approval_state
           ) VALUES (
-            ${id}, ${input.tenantId}, ${context.project.organizationId}, ${context.project.id}, ${context.finding.scanId},
-            ${context.finding.id}, ${idempotencyKey}, 'pending_approval', 3, ${input.requesterIdentityUserId},
+            ${id}, ${input.tenantId}, ${context.project.organizationId}::uuid, ${context.project.id}, ${context.finding.scanId},
+            ${context.finding.id}, ${idempotencyKey}, 'pending_approval', 3, ${input.requesterIdentityUserId}::uuid,
             ${context.binding.id}::uuid, ${context.binding.githubRepositoryId}, ${planHash}, ${JSON.stringify(snapshot)}::jsonb, 'pending'
           ) RETURNING ${Prisma.raw(RETURNING_PROPOSAL)}
         `;
@@ -229,26 +280,26 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
           tenantId: input.tenantId, organizationId: context.project.organizationId, projectId: context.project.id,
           actorId: input.actorSubject, actorIdentityUserId: input.requesterIdentityUserId,
           action: "REMEDIATION_PROPOSAL_CREATED", resourceType: "remediation", resourceId: row.id,
-          metadataJson: { findingId: row.finding_id, planHash, repositoryBindingId: context.binding.id, githubRepositoryId: context.binding.githubRepositoryId.toString() }
+          metadataJson: { findingId: row.finding_id, ...(row.finding_id !== input.findingId ? { sourceFindingId: input.findingId, sourceScanId: context.sourceScanId } : {}), planHash, repositoryBindingId: context.binding.id, githubRepositoryId: context.binding.githubRepositoryId.toString() }
         } });
-        await tx.organizationAuditEvent.create({ data: {
+        await tx.organizationAuditEvent.create({ select: { id: true }, data: {
           organizationId: context.project.organizationId!, tenantId: input.tenantId, projectId: context.project.id,
           actorType: "user", actorUserId: input.requesterIdentityUserId, action: "REMEDIATION_PROPOSAL_CREATED",
           targetType: "remediation", targetId: row.id,
-          metadata: { planHash, repositoryBindingId: context.binding.id, githubRepositoryId: context.binding.githubRepositoryId.toString() }
+          metadata: { planHash, repositoryBindingId: context.binding.id, githubRepositoryId: context.binding.githubRepositoryId.toString(), ...(row.finding_id !== input.findingId ? { findingId: row.finding_id, sourceFindingId: input.findingId, sourceScanId: context.sourceScanId } : {}) }
         } });
         return { proposal: publicProposal(row), replayed: false };
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {
       if (error instanceof RemediationProposalError) throw error;
       if (!isWriteConflict(error)) throw error;
-      const conflict = conflictIdentity as { key: string; hash: string; binding: string; repositoryId: bigint; organizationId: string } | null;
+      const conflict = conflictIdentity as { key: string; hash: string; binding: string; repositoryId: bigint; organizationId: string; findingId: string } | null;
       if (conflict) {
         const winner = await this.prisma.$queryRaw<ProposalRow[]>`
           SELECT ${Prisma.raw(RETURNING_PROPOSAL)} FROM remediations WHERE idempotency_key = ${conflict.key} LIMIT 1
         `;
         if (winner[0] && winner[0].tenant_id === input.tenantId && winner[0].project_id === input.projectId &&
-            winner[0].finding_id === input.findingId && winner[0].organization_id === conflict.organizationId &&
+            winner[0].finding_id === conflict.findingId && winner[0].organization_id === conflict.organizationId &&
             winner[0].repository_binding_id === conflict.binding && winner[0].github_repository_id === conflict.repositoryId &&
             winner[0].plan_hash === conflict.hash && winner[0].approval_state !== null) {
           assertPlanSnapshotIntegrity(winner[0]);
@@ -263,13 +314,80 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     prior: ProposalRow, input: CreateRemediationProposalInput,
     context: Awaited<ReturnType<PrismaRemediationProposalRepository["loadContext"]>>, planHash: string
   ) {
-    if (prior.tenant_id !== input.tenantId || prior.project_id !== input.projectId || prior.finding_id !== input.findingId ||
+    if (prior.tenant_id !== input.tenantId || prior.project_id !== input.projectId || prior.finding_id !== context.finding.id ||
         prior.organization_id !== context.project.organizationId || prior.repository_binding_id !== context.binding.id ||
         prior.github_repository_id !== context.binding.githubRepositoryId || prior.plan_hash !== planHash || prior.approval_state === null) {
       throw new RemediationProposalError(409, "An existing remediation conflicts with the current proposal context.");
     }
     assertPlanSnapshotIntegrity(prior);
     return { proposal: publicProposal(prior), replayed: true };
+  }
+
+  async listByProject(input: RemediationProposalListInput): Promise<RemediationProposalPage> {
+    const project = await this.prisma.project.findFirst({
+      where: { id: input.projectId, tenantId: input.tenantId },
+      select: { id: true, organizationId: true }
+    });
+    if (!project) throw new RemediationProposalError(404, "Project not found.");
+    if (!project.organizationId) return { items: [], hasMore: false };
+    const member = await this.prisma.organizationMember.findFirst({
+      where: {
+        organizationId: project.organizationId,
+        userId: input.identityUserId,
+        status: "active",
+        user: { is: { status: "active" } },
+        organization: { is: { status: "active" } }
+      },
+      select: { role: true }
+    });
+    if (!member || !hasOrganizationPermission(member.role, "remediation:read")) {
+      throw new RemediationProposalError(404, "Project not found.");
+    }
+
+    let cursorRow: { id: string; created_at: Date } | undefined;
+    if (input.cursor) {
+      const cursorRows = await this.prisma.$queryRaw<Array<{ id: string; created_at: Date }>>`
+        SELECT id, created_at FROM remediations
+        WHERE id = ${input.cursor}
+          AND tenant_id = ${input.tenantId}
+          AND project_id = ${input.projectId}
+          AND organization_id = ${project.organizationId}::uuid
+          AND approval_state IS NOT NULL
+        LIMIT 1
+      `;
+      cursorRow = cursorRows[0];
+      if (!cursorRow) throw new RemediationProposalError(400, "Invalid remediation proposal cursor.");
+    }
+
+    const rows = await this.prisma.$queryRaw<ProposalRow[]>`
+      SELECT ${Prisma.raw(RETURNING_PROPOSAL)} FROM remediations
+      WHERE tenant_id = ${input.tenantId}
+        AND project_id = ${input.projectId}
+        AND organization_id = ${project.organizationId}::uuid
+        AND approval_state IS NOT NULL
+        ${cursorRow ? Prisma.sql`AND (created_at < ${cursorRow.created_at} OR (created_at = ${cursorRow.created_at} AND id < ${cursorRow.id}))` : Prisma.empty}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ${input.limit + 1}
+    `;
+    const hasMore = rows.length > input.limit;
+    const pageRows = hasMore ? rows.slice(0, input.limit) : rows;
+    const items = [];
+    for (const row of pageRows) {
+      assertPlanSnapshotIntegrity(row);
+      const checked = await this.invalidateIfFindingResolved(this.prisma, row);
+      const latestOutcome = await this.findLatestFindingOutcomeForProposal(this.prisma, checked.row);
+      const invalidationReason = await this.resolveInvalidationReason(this.prisma, checked.row, checked.resolvedScanId);
+      items.push({
+        ...publicProposal(checked.row),
+        findingResolution: deriveFindingResolution(latestOutcome),
+        ...(invalidationReason ? { invalidationReason } : {})
+      });
+    }
+    return {
+      items,
+      hasMore,
+      ...(hasMore && pageRows.length > 0 ? { nextCursor: pageRows[pageRows.length - 1].id } : {})
+    };
   }
 
   async read(input: { tenantId: string; remediationId: string; identityUserId: string }): Promise<Record<string, unknown>> {
@@ -285,12 +403,15 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     if (!member || !hasOrganizationPermission(member.role, "remediation:read")) throw new RemediationProposalError(404, "Remediation proposal not found.");
     assertPlanSnapshotIntegrity(row);
     assertArtifactIntegrity(row);
+    const checked = await this.invalidateIfFindingResolved(this.prisma, row);
+    const latestOutcome = await this.findLatestFindingOutcomeForProposal(this.prisma, checked.row);
+    const invalidationReason = await this.resolveInvalidationReason(this.prisma, checked.row, checked.resolvedScanId);
     const execution = await this.prisma.remediationExecution.findFirst({
       where: { remediationId: row.id, tenantId: row.tenant_id, organizationId: row.organization_id, projectId: row.project_id },
       select: { status: true, stage: true, attemptNumber: true, commitSha: true, branchName: true,
         pullRequestNumber: true, pullRequestUrl: true, failureCode: true, updatedAt: true }
     });
-    return { ...publicProposal(row), permissions: {
+    return { ...publicProposal(checked.row), prDeliveryStatus: derivePrDeliveryStatus(checked.row.status, execution?.status), findingResolution: deriveFindingResolution(latestOutcome), ...(invalidationReason ? { invalidationReason } : {}), permissions: {
       prepareArtifact: hasOrganizationPermission(member.role, "remediation:create"),
       approve: hasOrganizationPermission(member.role, "remediation:approve")
     }, execution: execution ? {
@@ -321,6 +442,10 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
       assertPlanSnapshotIntegrity(row);
       if (row.approval_state !== "pending" || row.status !== "pending_approval")
         throw new RemediationProposalError(409, "The proposal is no longer eligible for an execution artifact.");
+      const resolvedCheck = await this.invalidateIfFindingResolved(tx, row, input.identityUserId);
+      if (resolvedCheck.resolvedScanId) {
+        throw new RemediationProposalError(409, "The original finding was resolved in a newer completed scan; review a new proposal if the gap recurs.");
+      }
       if (row.execution_artifact !== null || row.execution_artifact_hash !== null) {
         const existing = assertArtifactIntegrity(row);
         if (existing && row.execution_artifact_hash) return { kind: "replay" as const, replay: row.execution_artifact_hash };
@@ -406,6 +531,10 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
         throw new RemediationProposalError(409, "Execution artifact validation failed.");
       if (row.approval_state !== "pending" || row.status !== "pending_approval")
         throw new RemediationProposalError(409, "The proposal is no longer eligible for an execution artifact.");
+      const resolvedCheck = await this.invalidateIfFindingResolved(tx, row, input.identityUserId);
+      if (resolvedCheck.resolvedScanId) {
+        throw new RemediationProposalError(409, "The original finding was resolved in a newer completed scan; review a new proposal if the gap recurs.");
+      }
       if (row.execution_artifact !== null || row.execution_artifact_hash !== null) {
         const existing = assertArtifactIntegrity(row);
         if (existing && row.execution_artifact_hash === input.sealed.artifactHash)
@@ -419,7 +548,7 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
       const updated = await tx.$queryRaw<Array<{ id: string }>>`
         UPDATE remediations SET execution_artifact = ${JSON.stringify(input.sealed.artifact)}::jsonb,
           execution_artifact_hash = ${input.sealed.artifactHash}, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}
+        WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}::uuid
           AND project_id = ${row.project_id} AND repository_binding_id = ${row.repository_binding_id}::uuid
           AND github_repository_id = ${row.github_repository_id} AND plan_hash = ${row.plan_hash}
           AND approval_state = 'pending' AND status = 'pending_approval'
@@ -450,8 +579,15 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
         await this.requireMembership(tx, input.identityUserId, row.organization_id, "remediation:approve");
         assertPlanSnapshotIntegrity(row);
         const artifact = assertArtifactIntegrity(row);
+        if (row.approval_state === "invalidated") {
+          return { kind: "conflict", approvalState: "invalidated", message: "This proposal has been invalidated and cannot be approved or rejected." };
+        }
         if (row.approval_state !== "pending" || row.status !== "pending_approval") {
           return { kind: "conflict", approvalState: row.approval_state, message: "The proposal has already transitioned." };
+        }
+        const resolvedCheck = await this.invalidateIfFindingResolved(tx, row, input.identityUserId);
+        if (resolvedCheck.resolvedScanId) {
+          return { kind: "conflict", approvalState: "invalidated", message: "The original finding was resolved in a newer completed scan; review a new proposal if the gap recurs." };
         }
         if (input.decision === "approve" && (!artifact || !row.execution_artifact_hash)) {
           return { kind: "conflict", approvalState: row.approval_state, message: "A verified execution artifact is required before approval." };
@@ -475,10 +611,10 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
         const nextState = input.decision === "approve" ? "approved" : "rejected";
         const changed = input.decision === "approve"
           ? await tx.$queryRaw<Array<{ id: string }>>`
-              UPDATE remediations SET approval_state = 'approved', approved_by_identity_user_id = ${input.identityUserId}::uuid,
+              UPDATE remediations SET approval_state = 'approved', status = 'pending', approved_by_identity_user_id = ${input.identityUserId}::uuid,
                 approved_at = CURRENT_TIMESTAMP, approved_artifact_hash = ${row.execution_artifact_hash},
                 updated_at = CURRENT_TIMESTAMP
-              WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}
+              WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}::uuid
                 AND project_id = ${row.project_id} AND repository_binding_id = ${row.repository_binding_id}::uuid
                 AND github_repository_id = ${row.github_repository_id} AND plan_hash = ${row.plan_hash}
                 AND execution_artifact_hash = ${row.execution_artifact_hash}
@@ -487,7 +623,7 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
           : await tx.$queryRaw<Array<{ id: string }>>`
               UPDATE remediations SET approval_state = 'rejected', rejected_by_identity_user_id = ${input.identityUserId}::uuid,
                 rejected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}
+              WHERE id = ${row.id} AND tenant_id = ${row.tenant_id} AND organization_id = ${row.organization_id}::uuid
                 AND project_id = ${row.project_id} AND repository_binding_id = ${row.repository_binding_id}::uuid
                 AND github_repository_id = ${row.github_repository_id} AND plan_hash = ${row.plan_hash}
                 AND status = 'pending_approval' AND approval_state = 'pending' RETURNING id
@@ -497,7 +633,7 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
           input.decision === "approve" ? "REMEDIATION_APPROVED" : "REMEDIATION_REJECTED",
           { planHash: row.plan_hash, artifactHash: input.decision === "approve" ? row.execution_artifact_hash : null,
             repositoryBindingId: row.repository_binding_id, githubRepositoryId: row.github_repository_id.toString() });
-        return { kind: "decided", approvalState: nextState, status: row.status };
+        return { kind: "decided", approvalState: nextState, status: input.decision === "approve" ? "pending" : row.status };
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {
       if (error instanceof RemediationProposalError) throw error;
@@ -508,7 +644,7 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
 
   private async loadContext(
     tx: Prisma.TransactionClient, tenantId: string, projectId: string, findingId: string, identityUserId: string,
-    permission: OrganizationPermission
+    permission: OrganizationPermission, options?: { adoptPreAdoptionFinding?: boolean }
   ) {
     const project = await tx.project.findFirst({ where: { id: projectId, tenantId }, select: { id: true, organizationId: true } });
     if (!project?.organizationId) throw new RemediationProposalError(404, "An adopted organization project is required.");
@@ -524,13 +660,14 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     if (!binding) throw new RemediationProposalError(409, "An active verified GitHub repository binding is required.");
     const finding = await tx.finding.findFirst({
       where: { id: findingId, tenantId, projectId },
-      select: { id: true, scanId: true, requirementId: true, ruleId: true, ruleVersion: true, signal: true, outcome: true, expected: true, observed: true, reason: true }
+      select: { id: true, organizationId: true, scanId: true, attemptNumber: true, requirementId: true, ruleId: true, ruleVersion: true, signal: true, outcome: true, expected: true, observed: true, reason: true, evidenceJson: true, createdAt: true }
     });
     if (!finding) throw new RemediationProposalError(404, "Finding not found.");
     if (finding.outcome !== "gap") throw new RemediationProposalError(422, "Only gap findings can be proposed for remediation.");
     if (!isRemediationSupported(finding.signal, finding.outcome)) throw new RemediationProposalError(422, "This finding signal is not supported for remediation.");
     try { planRemediation(finding); } catch { throw new RemediationProposalError(422, "No safe remediation plan is available for this finding."); }
-    return { project, finding: finding as ProposalFinding, binding: binding as ProposalBinding };
+    const scoped = await this.ensureOrganizationScopedFinding(tx, tenantId, project.organizationId, projectId, adoption.id, finding as ProposalFinding, Boolean(options?.adoptPreAdoptionFinding));
+    return { project, finding: scoped.finding, sourceScanId: scoped.sourceScanId, binding: binding as ProposalBinding };
   }
 
   private async currentSnapshot(
@@ -548,6 +685,219 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     }
   }
 
+  private async ensureOrganizationScopedFinding(
+    tx: Prisma.TransactionClient, tenantId: string, organizationId: string, projectId: string, _adoptionId: string,
+    finding: ProposalFinding, adoptPreAdoptionFinding: boolean
+  ): Promise<{ finding: ProposalFinding; sourceScanId: string }> {
+    const scanClient = (tx as unknown as { scan?: Prisma.TransactionClient["scan"] }).scan;
+    const scan = scanClient
+      ? await scanClient.findFirst({
+          where: { id: finding.scanId, tenantId, projectId },
+          select: {
+            id: true, organizationId: true, status: true, triggeredById: true, startedAt: true,
+            completedAt: true, error: true, attemptCount: true, maxAttempts: true, modelOverride: true, createdAt: true
+          }
+        })
+      : null;
+    if (scanClient && !scan) throw new RemediationProposalError(404, "Scan not found.");
+    if (finding.organizationId !== undefined && finding.organizationId !== null && finding.organizationId !== organizationId) {
+      throw new RemediationProposalError(409, "Finding organization does not match the adopted project organization.");
+    }
+    if (scan && scan.organizationId !== null && scan.organizationId !== organizationId) {
+      throw new RemediationProposalError(409, "Scan organization does not match the adopted project organization.");
+    }
+
+    const needsScanAdoption = Boolean(scan && scan.organizationId === null);
+    const needsFindingAdoption = finding.organizationId === null || needsScanAdoption;
+    if (!needsFindingAdoption) {
+      return { finding, sourceScanId: finding.scanId };
+    }
+    if (!adoptPreAdoptionFinding || !scanClient || !scan) {
+      throw new RemediationProposalError(409, "Finding is not scoped to the adopted project organization.");
+    }
+    if (scan.status !== "completed") {
+      throw new RemediationProposalError(409, "Only findings from completed scans can be proposed for remediation.");
+    }
+
+    const adoptedScanId = needsScanAdoption
+      ? deterministicAdoptionUuid(`cloudpilot:adopted-scan:v1:${tenantId}:${organizationId}:${projectId}:${scan.id}`)
+      : scan.id;
+    if (needsScanAdoption) {
+      const existingScan = await scanClient.findFirst({
+        where: { id: adoptedScanId, tenantId, organizationId, projectId },
+        select: { id: true }
+      });
+      if (!existingScan) {
+        await scanClient.create({
+          data: {
+            id: adoptedScanId,
+            tenantId,
+            organizationId,
+            projectId,
+            status: scan.status,
+            triggeredById: scan.triggeredById ?? null,
+            startedAt: scan.startedAt ?? null,
+            completedAt: scan.completedAt ?? null,
+            error: scan.error ?? null,
+            attemptCount: scan.attemptCount ?? 1,
+            maxAttempts: scan.maxAttempts ?? 3,
+            modelOverride: scan.modelOverride === null || scan.modelOverride === undefined
+              ? Prisma.JsonNull
+              : (scan.modelOverride as Prisma.InputJsonValue),
+            createdAt: scan.createdAt ?? new Date()
+          },
+          select: { id: true }
+        });
+      }
+    }
+
+    const adoptedFindingId = deterministicAdoptionUuid(
+      `cloudpilot:adopted-finding:v1:${tenantId}:${organizationId}:${projectId}:${adoptedScanId}:${finding.id}`
+    );
+    const existingFinding = await tx.finding.findFirst({
+      where: { id: adoptedFindingId, tenantId, organizationId, projectId, scanId: adoptedScanId },
+      select: {
+        id: true, organizationId: true, scanId: true, attemptNumber: true, requirementId: true, ruleId: true,
+        ruleVersion: true, signal: true, outcome: true, expected: true, observed: true, reason: true,
+        evidenceJson: true, createdAt: true
+      }
+    });
+    if (existingFinding) {
+      return { finding: existingFinding as ProposalFinding, sourceScanId: scan.id };
+    }
+    await tx.finding.create({
+      data: {
+        id: adoptedFindingId,
+        tenantId,
+        organizationId,
+        projectId,
+        scanId: adoptedScanId,
+        attemptNumber: finding.attemptNumber ?? 1,
+        requirementId: finding.requirementId,
+        ruleId: finding.ruleId,
+        ruleVersion: finding.ruleVersion,
+        signal: finding.signal,
+        outcome: finding.outcome,
+        expected: finding.expected,
+        observed: finding.observed,
+        reason: finding.reason,
+        evidenceJson: finding.evidenceJson === null || finding.evidenceJson === undefined
+          ? {}
+          : (finding.evidenceJson as Prisma.InputJsonValue),
+        createdAt: finding.createdAt ?? new Date()
+      },
+      select: { id: true }
+    });
+    return {
+      finding: { ...finding, id: adoptedFindingId, scanId: adoptedScanId, organizationId },
+      sourceScanId: scan.id
+    };
+  }
+
+  private async findLatestFindingOutcomeForProposal(
+    client: PrismaClient | Prisma.TransactionClient,
+    row: ProposalRow
+  ): Promise<{ scanId: string; outcome: string; completedAt: Date | null } | null> {
+    const rows = await client.$queryRaw<Array<{ scan_id: string; outcome: string; completed_at: Date | null }>>`
+      SELECT s.id AS scan_id, resolved.outcome AS outcome, s.completed_at AS completed_at
+      FROM findings orig
+      JOIN scans orig_s
+        ON orig_s.id = orig.scan_id
+       AND orig_s.tenant_id = orig.tenant_id
+       AND orig_s.project_id = orig.project_id
+      JOIN scans s
+        ON s.tenant_id = orig.tenant_id
+       AND s.project_id = orig.project_id
+      JOIN findings resolved
+        ON resolved.scan_id = s.id
+       AND resolved.tenant_id = s.tenant_id
+       AND resolved.project_id = s.project_id
+      WHERE orig.id = ${row.finding_id}
+        AND orig.tenant_id = ${row.tenant_id}
+        AND orig.project_id = ${row.project_id}
+        AND s.id <> orig.scan_id
+        AND s.status = 'completed'
+        AND COALESCE(s.completed_at, s.created_at) > GREATEST(COALESCE(orig_s.completed_at, orig_s.created_at), ${row.created_at})
+        AND resolved.requirement_id = orig.requirement_id
+        AND resolved.rule_id = orig.rule_id
+        AND resolved.rule_version = orig.rule_version
+        AND resolved.signal = orig.signal
+      ORDER BY COALESCE(s.completed_at, s.created_at) DESC, s.id DESC
+      LIMIT 1
+    `;
+    if (!rows[0]) return null;
+    return { scanId: rows[0].scan_id, outcome: rows[0].outcome, completedAt: rows[0].completed_at };
+  }
+
+  private async findResolvedScanForProposal(
+    client: PrismaClient | Prisma.TransactionClient,
+    row: ProposalRow
+  ): Promise<{ scanId: string; completedAt: Date | null } | null> {
+    const latest = await this.findLatestFindingOutcomeForProposal(client, row);
+    if (!latest || latest.outcome !== "pass") return null;
+    return { scanId: latest.scanId, completedAt: latest.completedAt };
+  }
+
+  private async invalidateIfFindingResolved(
+    client: PrismaClient | Prisma.TransactionClient,
+    row: ProposalRow,
+    actorIdentityUserId?: string
+  ): Promise<{ row: ProposalRow; resolvedScanId: string | null }> {
+    if (row.approval_state !== "pending" || row.status !== "pending_approval") {
+      return { row, resolvedScanId: null };
+    }
+    const resolved = await this.findResolvedScanForProposal(client, row);
+    if (!resolved) return { row, resolvedScanId: null };
+
+    const invalidatedBy = actorIdentityUserId ?? row.requested_by_identity_user_id;
+    const updated = await client.$queryRaw<ProposalRow[]>`
+      UPDATE remediations
+      SET approval_state = 'invalidated',
+          invalidated_by_identity_user_id = ${invalidatedBy}::uuid,
+          invalidated_at = COALESCE(invalidated_at, CURRENT_TIMESTAMP),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${row.id}
+        AND tenant_id = ${row.tenant_id}
+        AND status = 'pending_approval'
+        AND approval_state = 'pending'
+      RETURNING ${Prisma.raw(RETURNING_PROPOSAL)}
+    `;
+    const nextRow = updated[0] ?? row;
+    if (updated[0]) {
+      await client.organizationAuditEvent.create({
+        select: { id: true },
+        data: {
+          organizationId: row.organization_id,
+          tenantId: row.tenant_id,
+          projectId: row.project_id,
+          actorType: actorIdentityUserId ? "user" : "system",
+          ...(actorIdentityUserId ? { actorUserId: actorIdentityUserId } : { systemActorId: "stale-proposal-check" }),
+          action: "REMEDIATION_PROPOSAL_INVALIDATED",
+          targetType: "remediation",
+          targetId: row.id,
+          metadata: { reason: "finding_resolved", resolvedScanId: resolved.scanId, planHash: row.plan_hash } as Prisma.InputJsonValue
+        }
+      });
+    }
+    return { row: nextRow, resolvedScanId: resolved.scanId };
+  }
+
+  private async resolveInvalidationReason(
+    client: PrismaClient | Prisma.TransactionClient,
+    row: ProposalRow,
+    resolvedScanId?: string | null
+  ): Promise<string | null> {
+    if (row.approval_state !== "invalidated") return null;
+    if (resolvedScanId) {
+      return "The original finding was resolved in a newer completed scan.";
+    }
+    const resolved = await this.findResolvedScanForProposal(client, row);
+    if (resolved) {
+      return "The original finding was resolved in a newer completed scan.";
+    }
+    return "The plan, repository binding, or underlying finding state changed; review a new proposal if needed.";
+  }
+
   private async requireMembership(
     tx: Prisma.TransactionClient, identityUserId: string, organizationId: string, permission: OrganizationPermission
   ): Promise<void> {
@@ -562,7 +912,7 @@ export class PrismaRemediationProposalRepository implements RemediationProposalS
     tx: Prisma.TransactionClient, organizationId: string, tenantId: string, projectId: string, remediationId: string,
     actorUserId: string, action: string, metadata: Record<string, string | null>
   ): Promise<void> {
-    await tx.organizationAuditEvent.create({ data: {
+    await tx.organizationAuditEvent.create({ select: { id: true }, data: {
       organizationId, tenantId, projectId, actorType: "user", actorUserId, action,
       targetType: "remediation", targetId: remediationId, metadata: metadata as Prisma.InputJsonValue
     } });

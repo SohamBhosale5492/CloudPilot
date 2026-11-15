@@ -629,3 +629,280 @@ test("evaluateGap and evaluateExpectedObservabilityModel are deterministic for i
 
   assert.deepEqual(batchA, batchB);
 });
+
+test("evaluateGap marks loaded healthy alert rule as pass", () => {
+  const requirement: ExpectedAlertRequirement = {
+    id: "alert-req-pass",
+    signal: "alert",
+    associatedSignal: "metric",
+    condition: "up == 0",
+    severity: "warning"
+  };
+  const evidence: InspectorEvidence = {
+    requirementId: "alert-req-pass",
+    signal: "alert",
+    available: true,
+    complete: true,
+    collectedAt: NOW_ISO,
+    provenance: {
+      target: "http://127.0.0.1:9090",
+      adapter: "prometheus-alert",
+      source: "prometheus"
+    },
+    diagnostics: [],
+    data: {
+      configured: true,
+      backend: "prometheus",
+      matchedRules: [
+        {
+          name: "demo_heartbeat_alert",
+          group: "cloudpilot_alerts",
+          state: "inactive",
+          health: "ok"
+        }
+      ],
+      totalLoadedRules: 1,
+      ruleHealthy: true,
+      activeAlertCount: 0
+    }
+  };
+
+  const finding = evaluateGap(requirement, evidence, { evaluatedAt: NOW });
+  assert.equal(finding.outcome, "pass");
+  assert.ok(finding.reason.includes("loaded and evaluating cleanly"), `reason: ${finding.reason}`);
+});
+
+test("evaluateGap marks unloaded or unhealthy alert rules as gap", () => {
+  const requirement: ExpectedAlertRequirement = {
+    id: "alert-req-gap",
+    signal: "alert",
+    associatedSignal: "metric",
+    condition: "up == 0",
+    severity: "warning"
+  };
+  const config: GapEngineConfig = { evaluatedAt: NOW };
+
+  const unloadedFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "alert-req-gap",
+      signal: "alert",
+      available: true,
+      complete: true,
+      collectedAt: NOW_ISO,
+      provenance: {
+        target: "http://127.0.0.1:9090",
+        adapter: "prometheus-alert",
+        source: "prometheus"
+      },
+      diagnostics: [],
+      data: {
+        configured: true,
+        backend: "prometheus",
+        matchedRules: [],
+        totalLoadedRules: 0,
+        ruleHealthy: false,
+        activeAlertCount: 0
+      }
+    },
+    config
+  );
+  assert.equal(unloadedFinding.outcome, "gap");
+  assert.ok(unloadedFinding.reason.includes("no matching alerting rule"), `reason: ${unloadedFinding.reason}`);
+
+  const unhealthyFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "alert-req-gap",
+      signal: "alert",
+      available: true,
+      complete: true,
+      collectedAt: NOW_ISO,
+      provenance: {
+        target: "http://127.0.0.1:9090",
+        adapter: "prometheus-alert",
+        source: "prometheus"
+      },
+      diagnostics: [],
+      data: {
+        configured: true,
+        backend: "prometheus",
+        matchedRules: [
+          {
+            name: "demo_heartbeat_alert",
+            group: "cloudpilot_alerts",
+            state: "inactive",
+            health: "err",
+            lastError: "bad expression"
+          }
+        ],
+        totalLoadedRules: 1,
+        ruleHealthy: false,
+        activeAlertCount: 0
+      }
+    },
+    config
+  );
+  assert.equal(unhealthyFinding.outcome, "gap");
+  assert.ok(unhealthyFinding.reason.includes("evaluation error"), `reason: ${unhealthyFinding.reason}`);
+});
+
+test("evaluateGap marks incomplete or unavailable alert evidence as inconclusive or unknown", () => {
+  const requirement: ExpectedAlertRequirement = {
+    id: "alert-req-inc",
+    signal: "alert",
+    associatedSignal: "metric",
+    condition: "up == 0",
+    severity: "warning"
+  };
+  const config: GapEngineConfig = { evaluatedAt: NOW };
+
+  const inconclusiveFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "alert-req-inc",
+      signal: "alert",
+      available: true,
+      complete: false,
+      collectedAt: NOW_ISO,
+      provenance: {
+        target: "http://127.0.0.1:9090",
+        adapter: "prometheus-alert",
+        source: "prometheus"
+      },
+      diagnostics: [],
+      data: {
+        configured: true,
+        backend: "prometheus",
+        matchedRules: [],
+        totalLoadedRules: 0,
+        ruleHealthy: false,
+        activeAlertCount: 0
+      }
+    },
+    config
+  );
+  assert.equal(inconclusiveFinding.outcome, "inconclusive");
+
+  const unknownFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "alert-req-inc",
+      signal: "alert",
+      available: false,
+      complete: false,
+      collectedAt: NOW_ISO,
+      provenance: {
+        target: "http://127.0.0.1:9090",
+        adapter: "prometheus-alert",
+        source: "prometheus"
+      },
+      diagnostics: [],
+      data: {
+        configured: false,
+        backend: "prometheus",
+        matchedRules: [],
+        totalLoadedRules: 0,
+        ruleHealthy: false,
+        activeAlertCount: 0
+      }
+    },
+    config
+  );
+  assert.equal(unknownFinding.outcome, "unknown");
+});
+
+test("evaluateLogGap evaluates structured JSON logs, missing fields, empty logs, incomplete, and unconfigured", () => {
+  const requirement: ExpectedLogRequirement = {
+    id: "log-req-1",
+    signal: "log",
+    fields: ["level", "message", "trace_id"]
+  };
+  const config: GapEngineConfig = { evaluatedAt: NOW };
+  const provenance = { target: "http://127.0.0.1:3100", adapter: "loki-query" };
+
+  const passFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "log-req-1",
+      signal: "log",
+      available: true,
+      complete: true,
+      collectedAt: NOW_ISO,
+      provenance,
+      diagnostics: [],
+      data: {
+        totalEntries: 3,
+        validJsonEntries: 3,
+        observedFields: ["level", "message", "trace_id"],
+        missingFields: []
+      }
+    },
+    config
+  );
+  assert.equal(passFinding.outcome, "pass");
+
+  const emptyGap = evaluateGap(
+    requirement,
+    {
+      requirementId: "log-req-1",
+      signal: "log",
+      available: true,
+      complete: true,
+      collectedAt: NOW_ISO,
+      provenance,
+      diagnostics: [],
+      data: { totalEntries: 0, validJsonEntries: 0, observedFields: [], missingFields: ["level", "message", "trace_id"] }
+    },
+    config
+  );
+  assert.equal(emptyGap.outcome, "gap");
+
+  const missingFieldGap = evaluateGap(
+    requirement,
+    {
+      requirementId: "log-req-1",
+      signal: "log",
+      available: true,
+      complete: true,
+      collectedAt: NOW_ISO,
+      provenance,
+      diagnostics: [],
+      data: { totalEntries: 2, validJsonEntries: 2, observedFields: ["level", "message"], missingFields: ["trace_id"] }
+    },
+    config
+  );
+  assert.equal(missingFieldGap.outcome, "gap");
+
+  const inconclusiveFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "log-req-1",
+      signal: "log",
+      available: true,
+      complete: false,
+      collectedAt: NOW_ISO,
+      provenance,
+      diagnostics: [],
+      data: { reason: "malformed" }
+    },
+    config
+  );
+  assert.equal(inconclusiveFinding.outcome, "inconclusive");
+
+  const unknownFinding = evaluateGap(
+    requirement,
+    {
+      requirementId: "log-req-1",
+      signal: "log",
+      available: false,
+      complete: false,
+      collectedAt: NOW_ISO,
+      provenance,
+      diagnostics: [{ code: "BACKEND_UNCONFIGURED", severity: "info", message: "unconfigured" }],
+      data: { reason: "unconfigured" }
+    },
+    config
+  );
+  assert.equal(unknownFinding.outcome, "unknown");
+});

@@ -72,6 +72,30 @@ export interface TraceEvidenceData {
   traceCount: number;
 }
 
+export interface AlertRuleMatch {
+  name: string;
+  group: string;
+  state: string;
+  health: string;
+  query: string;
+  activeAlerts?: number;
+  lastEvaluation?: string;
+}
+
+export interface AlertEvidenceData {
+  matchedRules: AlertRuleMatch[];
+  totalLoadedRules: number;
+  ruleHealthy: boolean;
+  firingAlertCount?: number;
+}
+
+export interface LogEvidenceData {
+  totalEntries: number;
+  validJsonEntries: number;
+  observedFields: string[];
+  missingFields: string[];
+}
+
 export interface HealthInspectorOptions {
   baseUrl: string;
   requirement: ExpectedHealthCheckRequirement;
@@ -113,12 +137,22 @@ export interface TraceInspectorOptions {
 export interface LogInspectorOptions {
   requirement: ExpectedLogRequirement;
   backendUrl?: string;
+  serviceName?: string;
+  lookbackMinutes?: number;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  allowPrivateIps?: boolean;
+  fetchImpl?: typeof fetch;
   collectedAt?: Date;
 }
 
 export interface AlertInspectorOptions {
   requirement: ExpectedAlertRequirement;
   backendUrl?: string;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  allowPrivateIps?: boolean;
+  fetchImpl?: typeof fetch;
   collectedAt?: Date;
 }
 
@@ -795,58 +829,343 @@ function traceUnavailable(requirementId: string, collectedAt: string, target: st
     diagnostics: [{ code, severity: code === "BACKEND_UNCONFIGURED" ? "info" : "warning", message }] };
 }
 
-export function inspectLog(options: LogInspectorOptions): InspectorEvidence<UnconfiguredEvidenceData> {
+export async function inspectLog(
+  options: LogInspectorOptions
+): Promise<InspectorEvidence<LogEvidenceData | UnconfiguredEvidenceData>> {
   const requirementId = options?.requirement?.id ?? "<unknown>";
-  const collectedAt = (options?.collectedAt ?? new Date()).toISOString();
+  const collectedAtDate = options?.collectedAt ?? new Date();
+  const collectedAt = collectedAtDate.toISOString();
+  const backendUrl = options?.backendUrl;
 
+  if (!backendUrl) {
+    return {
+      signal: "log",
+      requirementId,
+      collectedAt,
+      available: false,
+      complete: false,
+      provenance: {
+        target: "<unconfigured>",
+        adapter: "loki-query"
+      },
+      data: {
+        reason: "Loki log backend adapter is not configured in this environment."
+      },
+      diagnostics: [
+        {
+          code: "BACKEND_UNCONFIGURED",
+          severity: "info",
+          message: "Log inspection backend is not configured for this project."
+        }
+      ]
+    };
+  }
+
+  const base = validateAndSanitizeUrl(backendUrl, { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!base.valid || !base.sanitizedUrl) {
+    return logUnavailable(
+      requirementId,
+      collectedAt,
+      "<invalid-url>",
+      base.diagnosticCode ?? "TARGET_INVALID",
+      base.reason ?? "Invalid Loki target URL."
+    );
+  }
+
+  const serviceName = options.serviceName ?? "demo-service";
+  const lookbackMinutes = options.lookbackMinutes ?? 15;
+  const endNs = BigInt(collectedAtDate.getTime()) * 1_000_000n;
+  const startNs = endNs - BigInt(lookbackMinutes * 60 * 1000) * 1_000_000n;
+
+  const url = new URL(base.sanitizedUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/loki/api/v1/query_range`;
+  url.searchParams.set("query", `{service_name="${serviceName}"}`);
+  url.searchParams.set("limit", "25");
+  url.searchParams.set("start", startNs.toString());
+  url.searchParams.set("end", endNs.toString());
+
+  const validatedTarget = validateAndSanitizeUrl(url.toString(), { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!validatedTarget.valid || !validatedTarget.sanitizedUrl) {
+    return logUnavailable(
+      requirementId,
+      collectedAt,
+      "<invalid-url>",
+      validatedTarget.diagnosticCode ?? "TARGET_INVALID",
+      validatedTarget.reason ?? "Invalid Loki query URL."
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBytes = options.maxResponseBytes ?? 256 * 1024;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await (options.fetchImpl ?? fetch)(validatedTarget.sanitizedUrl, {
+      method: "GET",
+      signal: controller.signal,
+      redirect: "manual",
+      headers: { accept: "application/json" }
+    });
+    if (response.status >= 300 && response.status < 400) {
+      return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "REDIRECT_DISALLOWED", "Loki query redirects are not followed.", true);
+    }
+    if (!response.ok) {
+      return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", `Loki query returned HTTP ${response.status}.`, true);
+    }
+    const body = await readBoundedText(response, maxBytes);
+    if (!body.ok) {
+      return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "RESPONSE_TOO_LARGE", "Loki response exceeded the configured size limit.", true);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.text);
+    } catch {
+      return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Loki returned malformed JSON.", true);
+    }
+    if (!isRecord(parsed) || parsed.status !== "success" || !isRecord(parsed.data) || !Array.isArray(parsed.data.result)) {
+      return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Loki response did not contain a valid streams result array.", true);
+    }
+
+    let totalEntries = 0;
+    let validJsonEntries = 0;
+    const observedFieldSet = new Set<string>();
+
+    for (const stream of parsed.data.result) {
+      if (!isRecord(stream) || !Array.isArray(stream.values)) continue;
+      for (const pair of stream.values) {
+        if (!Array.isArray(pair) || pair.length < 2 || typeof pair[1] !== "string") continue;
+        totalEntries += 1;
+        try {
+          const lineObj = JSON.parse(pair[1]);
+          if (isRecord(lineObj)) {
+            validJsonEntries += 1;
+            for (const [k, v] of Object.entries(lineObj)) {
+              if (v !== undefined && v !== null && String(v).length > 0) {
+                observedFieldSet.add(k);
+              }
+            }
+          }
+        } catch {
+          // Non-JSON log line; counted in totalEntries but not validJsonEntries.
+        }
+      }
+    }
+
+    const requiredFields = Array.isArray(options.requirement?.fields) ? options.requirement.fields : [];
+    const observedFields = Array.from(observedFieldSet).sort();
+    const missingFields = requiredFields.filter((f) => !observedFieldSet.has(f));
+
+    return {
+      signal: "log",
+      requirementId,
+      collectedAt,
+      available: true,
+      complete: true,
+      provenance: {
+        target: validatedTarget.sanitizedUrl,
+        adapter: "loki-query"
+      },
+      data: {
+        totalEntries,
+        validJsonEntries,
+        observedFields,
+        missingFields
+      },
+      diagnostics: []
+    };
+  } catch {
+    return logUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "PROBE_FAILED", "Loki log query could not be completed.");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function logUnavailable(
+  requirementId: string,
+  collectedAt: string,
+  target: string,
+  code: InspectorDiagnosticCode,
+  message: string,
+  available = false
+): InspectorEvidence<UnconfiguredEvidenceData> {
   return {
     signal: "log",
     requirementId,
     collectedAt,
-    available: false,
+    available,
     complete: false,
-    provenance: {
-      target: options?.backendUrl ?? "<unconfigured>",
-      adapter: "unconfigured-log-adapter"
-    },
-    data: {
-      reason: "Log backend adapter is not configured in this environment."
-    },
-    diagnostics: [
-      {
-        code: "BACKEND_UNCONFIGURED",
-        severity: "info",
-        message: "Log inspection backend is not configured in Phase 04."
-      }
-    ]
+    provenance: { target, adapter: "loki-query" },
+    data: { reason: message },
+    diagnostics: [{ code, severity: code === "BACKEND_UNCONFIGURED" ? "info" : "warning", message }]
   };
 }
 
-export function inspectAlert(options: AlertInspectorOptions): InspectorEvidence<UnconfiguredEvidenceData> {
-  const requirementId = options?.requirement?.id ?? "<unknown>";
-  const collectedAt = (options?.collectedAt ?? new Date()).toISOString();
-
+function alertUnavailable(
+  requirementId: string,
+  collectedAt: string,
+  target: string,
+  code: InspectorDiagnosticCode,
+  message: string,
+  available = false
+): InspectorEvidence<UnconfiguredEvidenceData> {
   return {
     signal: "alert",
     requirementId,
     collectedAt,
-    available: false,
+    available,
     complete: false,
-    provenance: {
-      target: options?.backendUrl ?? "<unconfigured>",
-      adapter: "unconfigured-alert-adapter"
-    },
-    data: {
-      reason: "Alert backend adapter is not configured in this environment."
-    },
-    diagnostics: [
-      {
-        code: "BACKEND_UNCONFIGURED",
-        severity: "info",
-        message: "Alert inspection backend is not configured in Phase 04."
-      }
-    ]
+    provenance: { target, adapter: "prometheus-rules" },
+    data: { reason: message },
+    diagnostics: [{ code, severity: code === "BACKEND_UNCONFIGURED" ? "info" : "warning", message }]
   };
+}
+
+export async function inspectAlert(
+  options: AlertInspectorOptions
+): Promise<InspectorEvidence<AlertEvidenceData | UnconfiguredEvidenceData>> {
+  const requirementId = options?.requirement?.id ?? "<unknown>";
+  const collectedAt = (options?.collectedAt ?? new Date()).toISOString();
+  const backendUrl = options?.backendUrl;
+
+  if (!backendUrl) {
+    return {
+      signal: "alert",
+      requirementId,
+      collectedAt,
+      available: false,
+      complete: false,
+      provenance: {
+        target: "<unconfigured>",
+        adapter: "unconfigured-alert-adapter"
+      },
+      data: {
+        reason: "Alert backend adapter is not configured in this environment."
+      },
+      diagnostics: [
+        {
+          code: "BACKEND_UNCONFIGURED",
+          severity: "info",
+          message: "Alert inspection backend is not configured."
+        }
+      ]
+    };
+  }
+
+  const base = validateAndSanitizeUrl(backendUrl, { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!base.valid || !base.sanitizedUrl) {
+    return alertUnavailable(
+      requirementId,
+      collectedAt,
+      "<invalid-url>",
+      base.diagnosticCode ?? "TARGET_INVALID",
+      base.reason ?? "Invalid Prometheus alert rules target URL."
+    );
+  }
+
+  const url = new URL(base.sanitizedUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/api/v1/rules`;
+  url.searchParams.set("type", "alert");
+  const validatedTarget = validateAndSanitizeUrl(url.toString(), { allowPrivateIps: Boolean(options?.allowPrivateIps) });
+  if (!validatedTarget.valid || !validatedTarget.sanitizedUrl) {
+    return alertUnavailable(
+      requirementId,
+      collectedAt,
+      "<invalid-url>",
+      validatedTarget.diagnosticCode ?? "TARGET_INVALID",
+      validatedTarget.reason ?? "Invalid Prometheus alert rules query URL."
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBytes = options.maxResponseBytes ?? 256 * 1024;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await (options.fetchImpl ?? fetch)(validatedTarget.sanitizedUrl, {
+      method: "GET",
+      signal: controller.signal,
+      redirect: "manual",
+      headers: { accept: "application/json" }
+    });
+    if (response.status >= 300 && response.status < 400) {
+      return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "REDIRECT_DISALLOWED", "Prometheus rules query redirects are not followed.", true);
+    }
+    if (!response.ok) {
+      return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", `Prometheus rules query returned HTTP ${response.status}.`, true);
+    }
+    const body = await readBoundedText(response, maxBytes);
+    if (!body.ok) {
+      return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "RESPONSE_TOO_LARGE", "Prometheus rules response exceeded the configured size limit.", true);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.text);
+    } catch {
+      return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Prometheus rules endpoint returned malformed JSON.", true);
+    }
+    if (!isRecord(parsed) || parsed.status !== "success" || !isRecord(parsed.data) || !Array.isArray(parsed.data.groups)) {
+      return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "STATUS_ERROR", "Prometheus rules response did not contain a valid groups array.", true);
+    }
+
+    let expectedAlertName = requirementId.replace(/[^a-zA-Z0-9_:]/g, "_").toLowerCase();
+    if (!/^[a-zA-Z_:]/.test(expectedAlertName)) {
+      expectedAlertName = `_${expectedAlertName}`;
+    }
+
+    const matchedRules: AlertRuleMatch[] = [];
+    let totalLoadedRules = 0;
+
+    for (const group of parsed.data.groups) {
+      if (!isRecord(group) || typeof group.name !== "string" || !Array.isArray(group.rules)) continue;
+      for (const rule of group.rules) {
+        if (!isRecord(rule) || rule.type !== "alerting" || typeof rule.name !== "string") continue;
+        totalLoadedRules += 1;
+        const labels = isRecord(rule.labels) ? rule.labels : {};
+        if (rule.name.toLowerCase() === expectedAlertName || labels.requirement_id === requirementId) {
+          const state = typeof rule.state === "string" ? rule.state : "unknown";
+          const alertsArr = Array.isArray(rule.alerts) ? rule.alerts : [];
+          const activeAlerts = alertsArr.filter((a) => isRecord(a) && a.state === "firing").length;
+          matchedRules.push({
+            name: rule.name,
+            group: group.name,
+            state,
+            health: typeof rule.health === "string" ? rule.health : "unknown",
+            query: typeof rule.query === "string" ? rule.query : "",
+            activeAlerts: state === "firing" ? Math.max(1, activeAlerts) : activeAlerts,
+            ...(typeof rule.lastEvaluation === "string" ? { lastEvaluation: rule.lastEvaluation } : {})
+          });
+        }
+      }
+    }
+
+    const ruleHealthy = matchedRules.length > 0 && matchedRules.every((r) => r.health === "ok");
+    const firingAlertCount = matchedRules.reduce((sum, r) => sum + (r.activeAlerts ?? 0), 0);
+
+    return {
+      signal: "alert",
+      requirementId,
+      collectedAt,
+      available: true,
+      complete: true,
+      provenance: {
+        target: validatedTarget.sanitizedUrl,
+        adapter: "prometheus-rules"
+      },
+      data: {
+        matchedRules,
+        totalLoadedRules,
+        ruleHealthy,
+        firingAlertCount
+      },
+      diagnostics: []
+    };
+  } catch {
+    return alertUnavailable(requirementId, collectedAt, validatedTarget.sanitizedUrl, "PROBE_FAILED", "Prometheus alert rules query could not be completed.");
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function inspectExpectedObservabilityRequirement(
@@ -910,13 +1229,21 @@ export async function inspectExpectedObservabilityRequirement(
       return inspectLog({
         requirement,
         backendUrl: config.logBackendUrl,
+        timeoutMs: config.timeoutMs,
+        maxResponseBytes: config.maxResponseBytes,
+        allowPrivateIps: config.allowPrivateIps,
+        fetchImpl: config.fetchImpl,
         collectedAt: config.collectedAt
       });
 
     case "alert":
       return inspectAlert({
         requirement,
-        backendUrl: config.alertBackendUrl,
+        backendUrl: config.alertBackendUrl ?? config.prometheusBaseUrl,
+        timeoutMs: config.timeoutMs,
+        maxResponseBytes: config.maxResponseBytes,
+        allowPrivateIps: config.allowPrivateIps,
+        fetchImpl: config.fetchImpl,
         collectedAt: config.collectedAt
       });
 

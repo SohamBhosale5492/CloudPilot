@@ -1,0 +1,10 @@
+# CloudPilot Observability — Distributed Tracing
+# cloudpilot:tracing
+tracing:
+  enabled: true
+  service_name: demo-service
+  propagators:
+    - tracecontext
+    - baggage
+  otlp_endpoint: http://otel-collector:4318/v1/traces
+  sample_ratio: 1.0

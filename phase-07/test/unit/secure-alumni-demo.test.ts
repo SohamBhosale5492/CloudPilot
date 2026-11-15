@@ -70,6 +70,7 @@ for (const scenario of [
     const metricRequirement = normalized.model?.requirements.find((item) => item.id === "secure-alumni-forgot-password-count");
     assert.ok(metricRequirement);
 
+    const metricQueries: string[] = [];
     const evidence = await inspectExpectedObservabilityRequirement(metricRequirement, {
       ...input.inspector,
       evaluatedAt,
@@ -84,8 +85,14 @@ for (const scenario of [
           return Response.json({ status: "success", data: { resultType: "matrix", result: [{ metric: { job: "otel-collector", instance: "127.0.0.1:8889" }, values }] } });
         }
         const query = url.searchParams.get("query") ?? "";
+        metricQueries.push(query);
         assert.match(query, /alumni_http_server_requests_total/);
-        assert.match(query, /exported_job="secure-alumni-backend"/);
+        assert.match(
+          query,
+          metricQueries.length === 1
+            ? /exported_job="secure-alumni-backend"/
+            : /service_name="secure-alumni-backend"/
+        );
         assert.match(query, /route="\/api\/auth\/forgot-password"/);
         assert.match(query, /method="POST"/);
         assert.match(query, /increase\(.*\[60s\]\)/);

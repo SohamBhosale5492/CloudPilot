@@ -2,6 +2,29 @@ import type { Prisma } from "@prisma/client";
 
 type Transaction = Prisma.TransactionClient;
 
+const MAX_SERIALIZATION_RETRIES = 3;
+
+function isSerializationFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const record = error as { code?: unknown; meta?: { code?: unknown } };
+  return record.code === "P2034" || record.code === "40001" || record.meta?.code === "40001";
+}
+
+/**
+ * Retries a pure Serializable transaction a bounded number of times on PostgreSQL
+ * serialization conflicts (`40001` / Prisma `P2034`).
+ */
+export async function withSerializationRetry<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isSerializationFailure(error) || attempt >= MAX_SERIALIZATION_RETRIES) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+    }
+  }
+}
+
 export async function lockActiveOrganization(tx: Transaction, organizationId: string): Promise<boolean> {
   const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`
     SELECT public.cloudpilot_lock_active_organization(${organizationId}::uuid) AS locked

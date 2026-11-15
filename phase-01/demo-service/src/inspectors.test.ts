@@ -434,7 +434,7 @@ test("inspectTrace reports unconfigured evidence while log and alert adapters re
     signal: "log",
     fields: ["trace_id", "level"]
   };
-  const logEvidence = inspectLog({ requirement: logReq });
+  const logEvidence = await inspectLog({ requirement: logReq });
   assert.equal(logEvidence.signal, "log");
   assert.equal(logEvidence.available, false);
   assert.equal(logEvidence.complete, false);
@@ -447,7 +447,7 @@ test("inspectTrace reports unconfigured evidence while log and alert adapters re
     condition: "rate > 0.05",
     severity: "critical"
   };
-  const alertEvidence = inspectAlert({ requirement: alertReq });
+  const alertEvidence = await inspectAlert({ requirement: alertReq });
   assert.equal(alertEvidence.signal, "alert");
   assert.equal(alertEvidence.available, false);
   assert.equal(alertEvidence.complete, false);
@@ -523,3 +523,177 @@ test("missing Prometheus and health targets return unconfigured evidence without
   assert.equal(health.diagnostics[0]?.code, "BACKEND_UNCONFIGURED");
   assert.equal(requests, 0);
 });
+
+test("inspectAlert verifies loaded Prometheus alerting rules from /api/v1/rules", async () => {
+  const requirement: ExpectedAlertRequirement = {
+    id: "demo-high-error-alert",
+    signal: "alert",
+    associatedSignal: "metric",
+    condition: "up == 0",
+    severity: "warning"
+  };
+
+  let requestedUrl = "";
+  const evidence = await inspectAlert({
+    requirement,
+    backendUrl: "http://127.0.0.1:9090",
+    allowPrivateIps: true,
+    fetchImpl: (async (url) => {
+      requestedUrl = String(url);
+      return new Response(JSON.stringify({
+        status: "success",
+        data: {
+          groups: [
+            {
+              name: "cloudpilot_alerts",
+              rules: [
+                {
+                  type: "alerting",
+                  name: "demo_high_error_alert",
+                  query: "up == 0",
+                  state: "inactive",
+                  health: "ok",
+                  labels: { severity: "warning", requirement_id: "demo-high-error-alert" }
+                }
+              ]
+            }
+          ]
+        }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch
+  });
+
+  assert.equal(requestedUrl, "http://127.0.0.1:9090/api/v1/rules?type=alert");
+  assert.equal(evidence.available, true);
+  assert.equal(evidence.complete, true);
+  assert.equal(evidence.provenance.adapter, "prometheus-rules");
+  assert.deepEqual(evidence.data, {
+    matchedRules: [
+      {
+        name: "demo_high_error_alert",
+        group: "cloudpilot_alerts",
+        state: "inactive",
+        health: "ok",
+        query: "up == 0",
+        activeAlerts: 0
+      }
+    ],
+    totalLoadedRules: 1,
+    ruleHealthy: true,
+    firingAlertCount: 0
+  });
+});
+
+test("inspectAlert reports empty match for unloaded rules and fails closed on malformed responses", async () => {
+  const requirement: ExpectedAlertRequirement = {
+    id: "missing-alert",
+    signal: "alert",
+    associatedSignal: "metric",
+    condition: "up == 0",
+    severity: "critical"
+  };
+
+  const unloaded = await inspectAlert({
+    requirement,
+    backendUrl: "http://127.0.0.1:9090",
+    allowPrivateIps: true,
+    fetchImpl: (async () => new Response(JSON.stringify({ status: "success", data: { groups: [] } }), { status: 200 })) as typeof fetch
+  });
+  assert.equal(unloaded.available, true);
+  assert.equal(unloaded.complete, true);
+  assert.deepEqual(unloaded.data, { matchedRules: [], totalLoadedRules: 0, ruleHealthy: false, firingAlertCount: 0 });
+
+  const malformed = await inspectAlert({
+    requirement,
+    backendUrl: "http://127.0.0.1:9090",
+    allowPrivateIps: true,
+    fetchImpl: (async () => new Response("{bad json", { status: 200 })) as typeof fetch
+  });
+  assert.equal(malformed.available, true);
+  assert.equal(malformed.complete, false);
+  assert.equal(malformed.diagnostics[0]?.code, "STATUS_ERROR");
+});
+
+test("inspectLog queries Loki for structured JSON logs and required fields", async () => {
+  const requirement = {
+    id: "demo-logs",
+    signal: "log" as const,
+    fields: ["level", "message", "trace_id"]
+  };
+
+  const unconfigured = await inspectLog({ requirement });
+  assert.equal(unconfigured.available, false);
+  assert.equal(unconfigured.complete, false);
+  assert.equal(unconfigured.diagnostics[0]?.code, "BACKEND_UNCONFIGURED");
+
+  const available = await inspectLog({
+    requirement,
+    backendUrl: "http://127.0.0.1:3100",
+    allowPrivateIps: true,
+    fetchImpl: (async () =>
+      new Response(
+        JSON.stringify({
+          status: "success",
+          data: {
+            resultType: "streams",
+            result: [
+              {
+                stream: { service_name: "demo-service" },
+                values: [
+                  [
+                    "1700000000000000000",
+                    JSON.stringify({ timestamp: "2026-11-15T00:00:00Z", level: "info", message: "GET /api/demo 200", trace_id: "abc123" })
+                  ]
+                ]
+              }
+            ]
+          }
+        }),
+        { status: 200 }
+      )) as typeof fetch
+  });
+  assert.equal(available.available, true);
+  assert.equal(available.complete, true);
+  assert.deepEqual(available.data, {
+    totalEntries: 1,
+    validJsonEntries: 1,
+    observedFields: ["level", "message", "timestamp", "trace_id"],
+    missingFields: []
+  });
+
+  const missingField = await inspectLog({
+    requirement,
+    backendUrl: "http://127.0.0.1:3100",
+    allowPrivateIps: true,
+    fetchImpl: (async () =>
+      new Response(
+        JSON.stringify({
+          status: "success",
+          data: {
+            resultType: "streams",
+            result: [
+              {
+                stream: { service_name: "demo-service" },
+                values: [["1700000000000000000", JSON.stringify({ level: "info", message: "no trace" })]]
+              }
+            ]
+          }
+        }),
+        { status: 200 }
+      )) as typeof fetch
+  });
+  assert.equal(missingField.available, true);
+  assert.equal(missingField.complete, true);
+  assert.deepEqual((missingField.data as { missingFields: string[] }).missingFields, ["trace_id"]);
+
+  const malformed = await inspectLog({
+    requirement,
+    backendUrl: "http://127.0.0.1:3100",
+    allowPrivateIps: true,
+    fetchImpl: (async () => new Response("not-json", { status: 200 })) as typeof fetch
+  });
+  assert.equal(malformed.available, true);
+  assert.equal(malformed.complete, false);
+  assert.equal(malformed.diagnostics[0]?.code, "STATUS_ERROR");
+});
+

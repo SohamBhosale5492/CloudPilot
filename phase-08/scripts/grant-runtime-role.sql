@@ -52,6 +52,9 @@ FROM cloudpilot_runtime;
 -- Prisma migration metadata is deployment-only, including on databases where
 -- an older/manual grant may already exist.
 REVOKE ALL PRIVILEGES ON TABLE public._prisma_migrations FROM cloudpilot_runtime;
+REVOKE SELECT (id, organization_id, tenant_id, project_id, adoption_id, actor_type,
+  actor_user_id, system_actor_id, action, target_type, target_id, metadata, created_at)
+  ON TABLE public.organization_audit_events FROM cloudpilot_runtime;
 
 GRANT SELECT ON TABLE
   public.projects, public.scans, public.findings, public.audit_events, public.remediations,
@@ -70,6 +73,9 @@ GRANT INSERT ON TABLE
   public.project_github_repositories, public.remediation_executions,
   public.remediation_execution_events, public.github_connect_intents
 TO cloudpilot_runtime;
+
+-- Prisma organization-audit creates return only the generated event ID.
+GRANT SELECT (id) ON TABLE public.organization_audit_events TO cloudpilot_runtime;
 
 -- Phase 06 supports explicit project deletion and removes partial scan findings
 -- before retrying a scan. No other application table requires runtime DELETE.

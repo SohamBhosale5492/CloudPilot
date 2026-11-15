@@ -615,12 +615,12 @@ test("Integration: listByProject returns paginated results in desc order", async
   }
 });
 
-test("Integration: unsupported signal (trace gap) → skipped, no DB row created", async () => {
-  const tracesFinding = makeGapFinding({ signal: "trace", ruleId: "rule.trace.uniq" });
+test("Integration: unsupported signal (log gap) → skipped, no DB row created", async () => {
+  const logsFinding = makeGapFinding({ signal: "log", ruleId: "rule.log.uniq" });
   const orch = makeOrchestrator();
 
   const before = await prisma.remediation.count({ where: { tenantId } });
-  const result = await orch.remediateOne(tenantId, projectId, scanId, "fake-trace-id", tracesFinding);
+  const result = await orch.remediateOne(tenantId, projectId, scanId, "fake-log-id", logsFinding);
   const after = await prisma.remediation.count({ where: { tenantId } });
 
   assert.equal(result.skipped, true);

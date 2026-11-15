@@ -26,10 +26,12 @@ export interface ProjectTargetConfig {
   prometheusBaseUrl?: string;
   healthBaseUrl?: string;
   traceBackendUrl?: string;
+  logBackendUrl?: string;
+  alertBackendUrl?: string;
   metricConfigs?: Record<string, MetricTargetConfig>;
 }
 
-const TARGET_CONFIG_KEYS = new Set(["prometheusBaseUrl", "healthBaseUrl", "traceBackendUrl", "metricConfigs"]);
+const TARGET_CONFIG_KEYS = new Set(["prometheusBaseUrl", "healthBaseUrl", "traceBackendUrl", "logBackendUrl", "alertBackendUrl", "metricConfigs"]);
 const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
 
 export function validateProjectTargetConfig(value: unknown): ValidationResult<ProjectTargetConfig> {
@@ -39,7 +41,7 @@ export function validateProjectTargetConfig(value: unknown): ValidationResult<Pr
   }
 
   const result: ProjectTargetConfig = {};
-  for (const key of ["prometheusBaseUrl", "healthBaseUrl", "traceBackendUrl"] as const) {
+  for (const key of ["prometheusBaseUrl", "healthBaseUrl", "traceBackendUrl", "logBackendUrl", "alertBackendUrl"] as const) {
     const raw = value[key];
     if (raw === undefined) continue;
     if (typeof raw !== "string") return { valid: false, error: `targetConfig.${key} must be a URL string.` };

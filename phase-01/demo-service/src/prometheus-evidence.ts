@@ -26,7 +26,10 @@ type PrometheusApiResult =
 
 type CoverageResult = "complete" | "incomplete" | "unavailable";
 
+export type PrometheusServiceLabel = "exported_job" | "service_name";
+
 const PROMETHEUS_SERVICE_LABEL = "exported_job";
+const PROMETHEUS_SERVICE_NAME_LABEL = "service_name";
 const PROMETHEUS_ROUTE_LABEL = "route";
 const PROMETHEUS_METHOD_LABEL = "method";
 const PROMETHEUS_STATUS_LABEL = "status_code";
@@ -35,6 +38,7 @@ const DEFAULT_SCRAPE_STEP_SECONDS = 5;
 const PROMETHEUS_METRIC_NAME_PATTERN = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const SUPPORTED_RESULT_LABELS = new Set([
   PROMETHEUS_SERVICE_LABEL,
+  PROMETHEUS_SERVICE_NAME_LABEL,
   PROMETHEUS_ROUTE_LABEL,
   PROMETHEUS_METHOD_LABEL,
   PROMETHEUS_STATUS_LABEL,
@@ -63,21 +67,40 @@ export async function collectPrometheusRequestMetricEvidence(options: Prometheus
       return unavailableEvidence(collectedAt);
     }
 
-    const metricResult = await queryPrometheus(buildPrometheusQueryUrl(options, queryTime), fetchImpl, controller.signal);
+    const primaryQuery = await queryMetricVector(
+      options,
+      queryTime,
+      PROMETHEUS_SERVICE_LABEL,
+      fetchImpl,
+      controller.signal
+    );
 
-    if (!metricResult.ok) {
+    if (!primaryQuery.ok) {
       return unavailableEvidence(collectedAt);
     }
 
-    const body = metricResult.body;
+    let rawResults = primaryQuery.result;
 
-    if (body.status !== "success" || body.data?.resultType !== "vector" || !Array.isArray(body.data.result)) {
-      return unavailableEvidence(collectedAt);
+    // Fallback to OpenTelemetry resource service_name only when the primary exported_job query yields zero series.
+    if (rawResults.length === 0) {
+      const fallbackQuery = await queryMetricVector(
+        options,
+        queryTime,
+        PROMETHEUS_SERVICE_NAME_LABEL,
+        fetchImpl,
+        controller.signal
+      );
+
+      if (!fallbackQuery.ok) {
+        return unavailableEvidence(collectedAt);
+      }
+
+      rawResults = fallbackQuery.result;
     }
 
     const samples: MetricSample[] = [];
 
-    for (const item of body.data.result) {
+    for (const item of rawResults) {
       const sample = normalizePrometheusResult(item, options.requirement);
 
       if (sample === undefined) {
@@ -101,13 +124,21 @@ export async function collectPrometheusRequestMetricEvidence(options: Prometheus
   }
 }
 
-export function buildPrometheusRequestMetricQuery(requirement: RequestMetricRequirement, collectionWindowSeconds: number): string {
+export function buildPrometheusRequestMetricQuery(
+  requirement: RequestMetricRequirement,
+  collectionWindowSeconds: number,
+  serviceLabel: PrometheusServiceLabel = PROMETHEUS_SERVICE_LABEL
+): string {
   if (!isValidPrometheusMetricName(requirement.metricName)) {
     throw new Error("Invalid Prometheus metric name.");
   }
 
+  if (serviceLabel !== PROMETHEUS_SERVICE_LABEL && serviceLabel !== PROMETHEUS_SERVICE_NAME_LABEL) {
+    throw new Error("Invalid Prometheus service label.");
+  }
+
   const matchers = [
-    `${PROMETHEUS_SERVICE_LABEL}="${escapePrometheusLabelValue(requirement.serviceName)}"`,
+    `${serviceLabel}="${escapePrometheusLabelValue(requirement.serviceName)}"`,
     `job="${PROMETHEUS_SCRAPE_JOB}"`,
     `${PROMETHEUS_ROUTE_LABEL}="${escapePrometheusLabelValue(requirement.route)}"`
   ];
@@ -116,7 +147,7 @@ export function buildPrometheusRequestMetricQuery(requirement: RequestMetricRequ
     matchers.push(`${PROMETHEUS_METHOD_LABEL}="${escapePrometheusLabelValue(requirement.method)}"`);
   }
 
-  return `sum by (${PROMETHEUS_SERVICE_LABEL},${PROMETHEUS_ROUTE_LABEL},${PROMETHEUS_METHOD_LABEL},${PROMETHEUS_STATUS_LABEL},job,instance) ` +
+  return `sum by (${serviceLabel},${PROMETHEUS_ROUTE_LABEL},${PROMETHEUS_METHOD_LABEL},${PROMETHEUS_STATUS_LABEL},job,instance) ` +
     `(increase(${requirement.metricName}{${matchers.join(",")}}[${collectionWindowSeconds}s]))`;
 }
 
@@ -172,9 +203,42 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-function buildPrometheusQueryUrl(options: PrometheusEvidenceOptions, queryTime: Date): URL {
+async function queryMetricVector(
+  options: PrometheusEvidenceOptions,
+  queryTime: Date,
+  serviceLabel: PrometheusServiceLabel,
+  fetchImpl: typeof fetch,
+  signal: AbortSignal
+): Promise<{ ok: true; result: unknown[] } | { ok: false }> {
+  const metricResult = await queryPrometheus(
+    buildPrometheusQueryUrl(options, queryTime, serviceLabel),
+    fetchImpl,
+    signal
+  );
+
+  if (!metricResult.ok) {
+    return { ok: false };
+  }
+
+  const body = metricResult.body;
+
+  if (body.status !== "success" || body.data?.resultType !== "vector" || !Array.isArray(body.data.result)) {
+    return { ok: false };
+  }
+
+  return { ok: true, result: body.data.result };
+}
+
+function buildPrometheusQueryUrl(
+  options: PrometheusEvidenceOptions,
+  queryTime: Date,
+  serviceLabel: PrometheusServiceLabel = PROMETHEUS_SERVICE_LABEL
+): URL {
   const url = buildPrometheusApiUrl(options.baseUrl, "/api/v1/query");
-  url.searchParams.set("query", buildPrometheusRequestMetricQuery(options.requirement, options.collectionWindowSeconds));
+  url.searchParams.set(
+    "query",
+    buildPrometheusRequestMetricQuery(options.requirement, options.collectionWindowSeconds, serviceLabel)
+  );
   url.searchParams.set("time", String(queryTime.getTime() / 1000));
 
   return url;
@@ -373,8 +437,11 @@ function normalizePrometheusResult(result: unknown, requirement: RequestMetricRe
     return undefined;
   }
 
+  const serviceName = resolvePrometheusServiceLabel(metric);
+
   if (
-    metric[PROMETHEUS_SERVICE_LABEL] !== requirement.serviceName ||
+    serviceName === undefined ||
+    serviceName !== requirement.serviceName ||
     metric[PROMETHEUS_ROUTE_LABEL] !== requirement.route ||
     (requirement.method !== undefined && metric[PROMETHEUS_METHOD_LABEL] !== requirement.method) ||
     metric.job !== PROMETHEUS_SCRAPE_JOB ||
@@ -394,7 +461,7 @@ function normalizePrometheusResult(result: unknown, requirement: RequestMetricRe
   }
 
   if (
-    !isNonEmptyString(metric[PROMETHEUS_SERVICE_LABEL]) ||
+    !isNonEmptyString(serviceName) ||
     !isNonEmptyString(metric[PROMETHEUS_ROUTE_LABEL]) ||
     !isNonEmptyString(metric[PROMETHEUS_METHOD_LABEL]) ||
     (PROMETHEUS_STATUS_LABEL in metric && !isNonEmptyString(metric[PROMETHEUS_STATUS_LABEL]))
@@ -405,13 +472,42 @@ function normalizePrometheusResult(result: unknown, requirement: RequestMetricRe
   return {
     metricName: requirement.metricName,
     labels: {
-      serviceName: metric[PROMETHEUS_SERVICE_LABEL],
+      serviceName,
       route: metric[PROMETHEUS_ROUTE_LABEL],
       method: metric[PROMETHEUS_METHOD_LABEL],
       statusCode: isNonEmptyString(metric[PROMETHEUS_STATUS_LABEL]) ? metric[PROMETHEUS_STATUS_LABEL] : undefined
     },
     value
   };
+}
+
+function resolvePrometheusServiceLabel(metric: Record<string, unknown>): string | undefined {
+  const hasExportedJob = Object.prototype.hasOwnProperty.call(metric, PROMETHEUS_SERVICE_LABEL) &&
+    metric[PROMETHEUS_SERVICE_LABEL] !== undefined;
+  const hasServiceName = Object.prototype.hasOwnProperty.call(metric, PROMETHEUS_SERVICE_NAME_LABEL) &&
+    metric[PROMETHEUS_SERVICE_NAME_LABEL] !== undefined;
+
+  if (!hasExportedJob && !hasServiceName) {
+    return undefined;
+  }
+
+  const exportedJob = metric[PROMETHEUS_SERVICE_LABEL];
+  const serviceName = metric[PROMETHEUS_SERVICE_NAME_LABEL];
+
+  if (hasExportedJob && !isNonEmptyString(exportedJob)) {
+    return undefined;
+  }
+
+  if (hasServiceName && !isNonEmptyString(serviceName)) {
+    return undefined;
+  }
+
+  // Reject conflicting service aliases rather than silently preferring one.
+  if (hasExportedJob && hasServiceName && exportedJob !== serviceName) {
+    return undefined;
+  }
+
+  return (hasExportedJob ? exportedJob : serviceName) as string;
 }
 
 function unavailableEvidence(collectedAt: string): TelemetryEvidence {

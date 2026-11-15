@@ -1,0 +1,5 @@
+# CloudPilot Observability — Health Checks
+# cloudpilot:health-checks
+health_checks:
+  - service: demo-service # cloudpilot:remediated:CP-RULE-OBS-GAP-HEALTH-PRESENT
+    endpoint: /ready

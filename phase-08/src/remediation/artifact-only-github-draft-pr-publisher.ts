@@ -208,17 +208,24 @@ export class ArtifactOnlyGitHubDraftPrPublisher {
     const contentClient = this.capabilities.clientFor(capability);
     if (!contentClient) return { kind: "failed", code: "invalid_trust_input" };
     const branchName = deriveRemediationBranchName(capability);
-    const expiresAt = Math.min(Date.parse(capability.expiresAt), Date.parse(capability.lease.expiresAt));
+    // Latest validated, token-bounded deadline from the capability service; follows accepted renewals.
+    const deadlinePassed = (): boolean => {
+      const deadline = this.capabilities.currentDeadlineFor(capability);
+      return deadline === null || !Number.isFinite(deadline) || deadline <= this.now();
+    };
     const controller = new AbortController();
     const abort = () => controller.abort();
     if (input.signal?.aborted) controller.abort();
     else input.signal?.addEventListener("abort", abort, { once: true });
+    // Abort any in-flight request as soon as the capability is revoked or its latest deadline passes.
+    const stopDeadlineWatch = this.capabilities.watchDeadline(capability, () => controller.abort());
     const guard = async (): Promise<void> => {
-      if (controller.signal.aborted || !Number.isFinite(expiresAt) || expiresAt <= this.now()) {
+      if (controller.signal.aborted || deadlinePassed()) {
         controller.abort(); throw new PublishFailure("lease_lost");
       }
       try { await leaseGuard.assertOwned(controller.signal); }
       catch { controller.abort(); throw new PublishFailure("lease_lost"); }
+      if (deadlinePassed()) { controller.abort(); throw new PublishFailure("lease_lost"); }
     };
     let branchMutationStarted = false;
     let pullRequestMutationStarted = false;
@@ -281,10 +288,15 @@ export class ArtifactOnlyGitHubDraftPrPublisher {
 
       const prCapability = await this.capabilities.issueDraftPullRequestCapability(capability);
       if (!prCapability || !matchesPullRequestCapability(prCapability, capability)) {
+        // The deterministic branch was created remotely by this call; never report an ordinary retryable failure.
+        if (branchCreatedThisCall) return { kind: "manual_review", code: "lease_lost_after_write", branchName };
         return { kind: "failed", code: "github_request_failed" };
       }
       const pullClient = this.capabilities.pullRequestClientFor(prCapability);
-      if (!pullClient) return { kind: "failed", code: "invalid_trust_input" };
+      if (!pullClient) {
+        if (branchCreatedThisCall) return { kind: "manual_review", code: "lease_lost_after_write", branchName };
+        return { kind: "failed", code: "invalid_trust_input" };
+      }
       const prRepository = await pullClient.resolveRepository(controller.signal);
       if (!matchesRepository(prRepository, capability)) throw new PublishFailure("invalid_trust_input");
 
@@ -407,7 +419,8 @@ export class ArtifactOnlyGitHubDraftPrPublisher {
     } catch (error) {
       controller.abort();
       if (possiblePullRequest) return manualPr("pull_request_verification_failed", possiblePullRequest, branchName);
-      if (error instanceof PublishFailure && error.code === "lease_lost") {
+      if ((error instanceof PublishFailure && error.code === "lease_lost") ||
+          (error instanceof ArtifactGitHubClientError && error.code === "invalid_token")) {
         if (pullRequestMutationStarted || branchMutationStarted || branchMayExist || branchCreatedThisCall) {
           return { kind: "manual_review", code: "lease_lost_after_write", branchName };
         }
@@ -418,6 +431,7 @@ export class ArtifactOnlyGitHubDraftPrPublisher {
       if (branchMayExist) return { kind: "manual_review", code: "ambiguous_branch_creation", branchName };
       return { kind: "failed", code: "github_request_failed" };
     } finally {
+      stopDeadlineWatch();
       input.signal?.removeEventListener("abort", abort);
     }
   }

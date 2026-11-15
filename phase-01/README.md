@@ -19,6 +19,7 @@ docker compose -f phase-01/docker-compose.yml up -d --build
 | `http://localhost:3000/api/demo` | Deterministic demo API response |
 | `http://localhost:9090` | Prometheus UI |
 | `http://localhost:16686` | Jaeger UI |
+| `http://localhost:3100` | Grafana Loki HTTP API |
 | `http://localhost:4318` | Collector OTLP HTTP receiver |
 | `http://127.0.0.1:13133/` | Collector health-check extension (loopback only) |
 
@@ -29,7 +30,17 @@ The Collector's Prometheus exporter is internal-only at `otel-collector:8889`; P
 
 `demo-service -> OTLP HTTP -> otel-collector -> OTLP gRPC -> jaeger`
 
+`demo-service -> structured JSON stdout + Loki Push API (/loki/api/v1/push) -> loki`
+
 The service records bounded-cardinality metrics with `method`, `route`, and `status_code` labels. It does not use raw URLs, request IDs or user IDs as metric labels.
+
+## Dynamic Metrics, Tracing, Health Checks, Logs & Alert Rules Configuration (`config/observability/`)
+- `demo-service` loads dynamic counter definitions from `METRICS_CONFIG_PATH` or `config/observability/metrics.yaml` (`src/metrics-config.ts`). When a CloudPilot metric remediation patch adds an entry to `metrics.yaml`, the service registers the OpenTelemetry counter (stripping any terminal `_total` suffix so Prometheus exports a single `_total` suffix) and increments it on matching HTTP requests (`route`, `method`, and configured labels).
+- `demo-service` loads OpenTelemetry tracing configuration from `TRACING_CONFIG_PATH` or `config/observability/tracing.yaml` (`src/tracing-config.ts`), conditionally enabling `OTLPTraceExporter` and `HttpInstrumentation` in `src/telemetry.ts` and emitting the `x-trace-id` response header when an active span exists.
+- `demo-service` also loads dynamic health check endpoints from `HEALTH_CONFIG_PATH` or `config/observability/health-checks.yaml` (`src/health-config.ts`), serving HTTP 200 `{ status: "healthy", service, endpoint }` on configured paths (e.g. `/ready`).
+- `demo-service` emits structured JSON logs (`src/logger.ts`) containing `timestamp`, `level`, `message`, `service`, `method`, `route`, `status_code`, and active `trace_id`/`span_id` to stdout and pushes them to Loki (`LOKI_PUSH_URL`); `inspectLog` (`src/inspectors.ts`) queries Loki `/loki/api/v1/query_range` and `evaluateLogGap` (`src/gap-engine.ts`) validates availability and required JSON fields.
+- Prometheus mounts `config/observability/alert-rules.yaml` at `/etc/prometheus/rules/alert-rules.yaml` (`prometheus.yml` `rule_files`), and `inspectAlert` (`src/inspectors.ts`) queries Prometheus `/api/v1/rules?type=alert` so `evaluateAlertGap` (`src/gap-engine.ts`) only marks an alert requirement as `pass` when the rule is actually loaded and healthy (`health === "ok"`), while reporting firing alert counts (`activeAlerts` / `firingAlertCount`).
+- Missing or malformed configuration files are handled safely without crashing the service.
 
 ## Verify
 ```powershell

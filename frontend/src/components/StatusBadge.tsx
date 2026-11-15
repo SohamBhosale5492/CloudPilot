@@ -2,6 +2,10 @@ import type { ScanStatus, FindingOutcome, RemediationStatus } from "../types/api
 
 const CLASS_BY_STATUS: Record<string, string> = {
   pending: "status-pending",
+  pending_approval: "status-pending",
+  approved: "status-completed",
+  rejected: "status-failed",
+  invalidated: "status-muted",
   running: "status-running",
   completed: "status-completed",
   failed: "status-failed",

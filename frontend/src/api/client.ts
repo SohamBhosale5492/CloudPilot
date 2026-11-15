@@ -103,7 +103,7 @@ export class CloudPilotApi {
   async disconnectGitHubRepository(projectId: string): Promise<{ projectId: string; configured: false; changed: boolean; repository: null }> {
     return (await this.client.delete(`/api/v1/projects/${encodeURIComponent(projectId)}/github-repository`)).data;
   }
-  async completeGitHubInstallation(input: { installationId: string; state: string; setupAction: "install" }): Promise<{
+  async completeGitHubInstallation(input: { installationId: string; state: string; setupAction: "install" | "update" }): Promise<{
     installationRecordId: string;
     organizationId: string;
     githubInstallationId: string;
@@ -155,6 +155,12 @@ export class CloudPilotApi {
   async retriggerRemediation(remediationId: string): Promise<{ remediationId: string; statusUrl: string; status: string }> {
     return (await this.client.post(`/api/v1/remediations/${encodeURIComponent(remediationId)}/retrigger`)).data;
   }
+  async listRemediationProposals(projectId: string, query: PageQuery = {}): Promise<Page<RemediationProposal>> {
+    return (await this.client.get<Page<RemediationProposal>>(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/remediation-proposals`,
+      { params: query.cursor ? { cursor: query.cursor } : {}, signal: query.signal }
+    )).data;
+  }
   async createRemediationProposal(projectId: string, findingId: string): Promise<{ proposal: RemediationProposal; replayed: boolean }> {
     return (await this.client.post<{ proposal: RemediationProposal; replayed: boolean }>(
       `/api/v1/projects/${encodeURIComponent(projectId)}/remediation-proposals`, { findingId }
@@ -177,6 +183,45 @@ export class CloudPilotApi {
   }
   async listOrganizations(): Promise<{ items: Array<{ id: string; displayName: string; role: string }>; hasMore: boolean }> {
     return (await this.client.get("/api/v1/organizations")).data;
+  }
+  async createOrganization(displayName: string, idempotencyKey: string): Promise<{
+    organization: { id: string; displayName: string; status: string; createdAt: string };
+    membership: { role: string; status: string };
+  }> {
+    return (await this.client.post("/api/v1/organizations", { displayName }, {
+      headers: { "Idempotency-Key": idempotencyKey }
+    })).data;
+  }
+  async requestProjectAdoption(organizationId: string, projectId: string, idempotencyKey: string): Promise<{
+    adoption: { id: string; status: string; projectId: string };
+    replayed: boolean;
+  }> {
+    return (await this.client.post(
+      `/api/v1/organizations/${encodeURIComponent(organizationId)}/project-adoptions`,
+      { projectId },
+      { headers: { "Idempotency-Key": idempotencyKey } }
+    )).data;
+  }
+  async decideProjectAdoption(
+    organizationId: string,
+    adoptionId: string,
+    projectId: string,
+    decision: "approve" | "reject"
+  ): Promise<{ adoption: { id: string; status: "approved" | "rejected" } }> {
+    return (await this.client.post(
+      `/api/v1/organizations/${encodeURIComponent(organizationId)}/project-adoptions/${encodeURIComponent(adoptionId)}/${decision}`,
+      { projectId }
+    )).data;
+  }
+  async startGitHubInstallation(organizationId: string): Promise<{
+    intentId: string;
+    state: string;
+    installationUrl: string;
+    expiresAt: string;
+  }> {
+    return (await this.client.post(
+      `/api/v1/organizations/${encodeURIComponent(organizationId)}/github/installations/start`, {}
+    )).data;
   }
   async listOrganizationInstallations(organizationId: string): Promise<{ installations: Array<{ id: string; accountLogin: string; accountType: string; status: string }> }> {
     return (await this.client.get(`/api/v1/organizations/${encodeURIComponent(organizationId)}/github/installations`)).data;

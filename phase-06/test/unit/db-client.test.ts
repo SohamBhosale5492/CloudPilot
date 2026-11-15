@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { disconnectPrisma, getPrismaClient, requireDatabaseUrl } from "../../src/db/client.js";
+import { checkDatabaseConnection, disconnectPrisma, getPrismaClient, requireDatabaseUrl } from "../../src/db/client.js";
 import { cleanupTestOwnedFixtures, requireDedicatedPhase06TestDatabase } from "../integration/safety.js";
 
 test("DATABASE_URL validation fails immediately when missing or malformed", async () => {
@@ -64,4 +64,13 @@ test("fixture cleanup deletes only explicitly supplied tenant IDs", async () => 
   calls.length = 0;
   await cleanupTestOwnedFixtures(prisma, []);
   assert.deepEqual(calls, []);
+});
+
+test("checkDatabaseConnection returns ok=false when query hangs past timeout", async () => {
+  const stalledPrisma = {
+    $queryRawUnsafe: () => new Promise(() => {})
+  } as never;
+  const result = await checkDatabaseConnection(stalledPrisma, 50);
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /timed out after 50ms/);
 });

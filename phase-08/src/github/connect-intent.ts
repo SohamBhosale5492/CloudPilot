@@ -152,7 +152,8 @@ export class PrismaGitHubConnectIntentStore implements GitHubConnectIntentStore 
           targetType: "github_connect_intent",
           targetId: intent.id,
           metadata: { intentId: intent.id }
-        }
+        },
+        select: { id: true }
       });
       return intent;
     });

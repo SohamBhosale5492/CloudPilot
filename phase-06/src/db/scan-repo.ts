@@ -363,6 +363,49 @@ export class ScanRepository {
         }
       });
 
+      if (findings.some((f) => f.outcome === "pass")) {
+        const invalidated = await tx.$queryRaw<Array<{ id: string }>>`
+          UPDATE remediations r
+          SET approval_state = 'invalidated',
+              invalidated_by_identity_user_id = r.requested_by_identity_user_id,
+              invalidated_at = COALESCE(r.invalidated_at, NOW()),
+              updated_at = NOW()
+          FROM findings orig
+          JOIN findings resolved
+            ON resolved.tenant_id = orig.tenant_id
+           AND resolved.project_id = orig.project_id
+           AND resolved.scan_id = ${lease.scanId}
+           AND resolved.requirement_id = orig.requirement_id
+           AND resolved.rule_id = orig.rule_id
+           AND resolved.rule_version = orig.rule_version
+           AND resolved.signal = orig.signal
+           AND resolved.outcome = 'pass'
+          WHERE r.finding_id = orig.id
+            AND r.tenant_id = ${lease.tenantId}
+            AND r.project_id = ${lease.projectId}
+            AND orig.tenant_id = ${lease.tenantId}
+            AND orig.project_id = ${lease.projectId}
+            AND orig.scan_id <> ${lease.scanId}
+            AND r.status = 'pending_approval'
+            AND r.approval_state = 'pending'
+            AND r.requested_by_identity_user_id IS NOT NULL
+          RETURNING r.id
+        `;
+        if (invalidated.length > 0) {
+          await tx.auditEvent.createMany({
+            data: invalidated.map((row) => ({
+              tenantId: lease.tenantId,
+              projectId: lease.projectId,
+              actorId,
+              action: "REMEDIATION_PROPOSAL_INVALIDATED",
+              resourceType: "remediation",
+              resourceId: row.id,
+              metadataJson: { reason: "finding_resolved", resolvedScanId: lease.scanId } as Prisma.InputJsonValue
+            }))
+          });
+        }
+      }
+
       return scan;
     });
   }

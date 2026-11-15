@@ -55,26 +55,34 @@ export class PrismaProjectAdoptionService {
         if (!project) throw new ProjectAdoptionError(404, "Project not found.");
         if (project.organizationId !== null) throw new ProjectAdoptionError(409, "Project already belongs to an organization.");
 
-        const adoption = await tx.projectOrganizationAdoption.create({ data: {
-          tenantId: input.tenantId,
-          projectId: input.projectId,
-          organizationId: input.organizationId,
-          requestedByIdentityUserId: input.identityUserId,
-          idempotencyKey: input.idempotencyKey,
-          requestHash: hash,
-          provenance: { source: "authenticated-organization-project-adoption", tenantVerifiedByApi: true } as Prisma.InputJsonValue
-        } });
-        await tx.organizationAuditEvent.create({ data: {
-          organizationId: input.organizationId,
-          tenantId: input.tenantId,
-          projectId: input.projectId,
-          adoptionId: adoption.id,
-          actorUserId: input.identityUserId,
-          action: "PROJECT_ADOPTION_REQUESTED",
-          targetType: "project_organization_adoption",
-          targetId: adoption.id,
-          metadata: { projectId: input.projectId, status: "pending" } as Prisma.InputJsonValue
-        } });
+        const adoption = await tx.projectOrganizationAdoption.create({
+          data: {
+            tenantId: input.tenantId,
+            projectId: input.projectId,
+            organizationId: input.organizationId,
+            requestedByIdentityUserId: input.identityUserId,
+            idempotencyKey: input.idempotencyKey,
+            requestHash: hash,
+            provenance: { source: "authenticated-organization-project-adoption", tenantVerifiedByApi: true } as Prisma.InputJsonValue
+          },
+          select: { id: true, status: true, createdAt: true }
+        });
+        await tx.organizationAuditEvent.create({
+          data: {
+            organizationId: input.organizationId,
+            actorUserId: input.identityUserId,
+            action: "PROJECT_ADOPTION_REQUESTED",
+            targetType: "project_organization_adoption",
+            targetId: adoption.id,
+            metadata: {
+              tenantId: input.tenantId,
+              projectId: input.projectId,
+              adoptionId: adoption.id,
+              status: "pending"
+            } as Prisma.InputJsonValue
+          },
+          select: { id: true }
+        });
         return { adoption, replayed: false };
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {
@@ -99,7 +107,8 @@ export class PrismaProjectAdoptionService {
       return await this.prisma.$transaction(async (tx) => {
       await this.requireIntegrationManager(tx, input.identityUserId, input.organizationId);
       const adoption = await tx.projectOrganizationAdoption.findFirst({
-        where: { id: input.adoptionId, tenantId: input.tenantId, organizationId: input.organizationId, projectId: input.projectId }
+        where: { id: input.adoptionId, tenantId: input.tenantId, organizationId: input.organizationId, projectId: input.projectId },
+        select: { id: true, status: true }
       });
       if (!adoption) throw new ProjectAdoptionError(404, "Project adoption not found.");
       if (adoption.status !== "pending") throw new ProjectAdoptionError(409, "Project adoption is no longer pending.");
@@ -119,17 +128,31 @@ export class PrismaProjectAdoptionService {
         });
         if (adopted.count !== 1) throw new ProjectAdoptionError(409, "Project ownership changed before approval.");
       }
-      await tx.organizationAuditEvent.create({ data: {
-        organizationId: input.organizationId,
-        tenantId: input.tenantId,
-        projectId: input.projectId,
-        adoptionId: adoption.id,
-        actorUserId: input.identityUserId,
-        action: input.decision === "approve" ? "PROJECT_ADOPTION_APPROVED" : "PROJECT_ADOPTION_REJECTED",
-        targetType: "project_organization_adoption",
-        targetId: adoption.id,
-        metadata: { projectId: input.projectId, status: input.decision === "approve" ? "approved" : "rejected" } as Prisma.InputJsonValue
-      } });
+      await tx.organizationAuditEvent.create({
+        data: {
+          organizationId: input.organizationId,
+          ...(input.decision === "approve"
+            ? {
+                tenantId: input.tenantId,
+                projectId: input.projectId,
+                adoptionId: adoption.id
+              }
+            : {}),
+          actorUserId: input.identityUserId,
+          action: input.decision === "approve" ? "PROJECT_ADOPTION_APPROVED" : "PROJECT_ADOPTION_REJECTED",
+          targetType: "project_organization_adoption",
+          targetId: adoption.id,
+          metadata: (input.decision === "approve"
+            ? { projectId: input.projectId, status: "approved" }
+            : {
+                tenantId: input.tenantId,
+                projectId: input.projectId,
+                adoptionId: adoption.id,
+                status: "rejected"
+              }) as Prisma.InputJsonValue
+        },
+        select: { id: true }
+      });
       return { id: adoption.id, status: input.decision === "approve" ? "approved" : "rejected" };
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {

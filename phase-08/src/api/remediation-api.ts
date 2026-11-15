@@ -22,6 +22,12 @@ function publicRecord(record: Remediation) {
     scanId: record.scanId,
     findingId: record.findingId,
     status: record.status,
+    prDeliveryStatus: record.status === "merged" ? "pr_merged"
+      : record.status === "closed" ? "pr_closed"
+        : record.status === "open" ? "draft_pr_created"
+          : record.status === "failed" ? "failed"
+            : record.status === "running" ? "in_progress"
+              : "not_started",
     branchName: record.branchName,
     prNumber: record.prNumber,
     prUrl: record.prUrl,

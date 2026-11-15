@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { GitHubExecutionOutcome } from "../../../phase-07/src/remediation/github-executor.js";
 import type { FindingSummary } from "../../../phase-07/src/remediation/planner.js";
 import { verifyExecutionArtifact, type ArtifactScope } from "../remediation/execution-artifact.js";
+import { withSerializationRetry } from "../remediation/postgres-lock-helpers.js";
 import type { RemediationExecutionLifecycle } from "./remediation-execution-lifecycle.js";
 
 export const REMEDIATION_LEASE_DURATION_MS = 60_000;
@@ -417,7 +418,7 @@ export class RemediationJobRepository implements RemediationJobStore {
 
   async renewLease(lease: RemediationLease, leaseDurationMs = REMEDIATION_LEASE_DURATION_MS): Promise<boolean> {
     const duration = leaseDuration(leaseDurationMs);
-    return this.prisma.$transaction(async (tx) => {
+    return withSerializationRetry(() => this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id FROM remediations WHERE id = ${lease.id} AND tenant_id = ${lease.tenantId}
           AND project_id = ${lease.projectId} AND status = 'running' AND worker_id = ${lease.workerId}
@@ -444,7 +445,7 @@ export class RemediationJobRepository implements RemediationJobStore {
       `;
       if (execution !== 1) throw new Error("Durable execution lease renewal failed.");
       return true;
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
   }
 
   async completeLease(

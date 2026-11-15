@@ -557,3 +557,35 @@ test("repeated preparation rechecks persisted authorization instead of reusing s
   h.state.approverMembership!.status = "inactive";
   assert.equal(await h.service.prepare(lease), null);
 });
+
+test("withSerializationRetry retries bounded PostgreSQL serialization conflicts and rethrows other errors", async () => {
+  const { withSerializationRetry } = await import("../../src/remediation/postgres-lock-helpers.js");
+  let attempts = 0;
+  const recovered = await withSerializationRetry(async () => {
+    attempts++;
+    if (attempts < 3) throw Object.assign(new Error("serialization failure"), { code: "P2034" });
+    return "ok";
+  });
+  assert.equal(recovered, "ok");
+  assert.equal(attempts, 3);
+
+  let nonRetryAttempts = 0;
+  await assert.rejects(
+    withSerializationRetry(async () => {
+      nonRetryAttempts++;
+      throw Object.assign(new Error("constraint violation"), { code: "P2002" });
+    }),
+    /constraint violation/
+  );
+  assert.equal(nonRetryAttempts, 1);
+
+  let exhaustedAttempts = 0;
+  await assert.rejects(
+    withSerializationRetry(async () => {
+      exhaustedAttempts++;
+      throw Object.assign(new Error("persistent conflict"), { meta: { code: "40001" } });
+    }),
+    /persistent conflict/
+  );
+  assert.equal(exhaustedAttempts, 4);
+});

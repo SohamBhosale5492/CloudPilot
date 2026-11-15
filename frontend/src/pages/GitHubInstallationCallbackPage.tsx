@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useApi } from "../api/ApiProvider";
 import { getErrorMessage } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { readGitHubInstallationReturn } from "../github/installation-flow";
 
 type CallbackParameters =
-  | { valid: true; installationId: string; state: string; setupAction: "install" }
+  | { valid: true; installationId: string; state: string; setupAction: "install" | "update" }
   | { valid: false };
 
 function readCallbackParameters(search: string): CallbackParameters {
@@ -21,20 +23,22 @@ function readCallbackParameters(search: string): CallbackParameters {
   if (installationIds.length !== 1 || states.length !== 1 || actions.length !== 1 ||
       typeof installationId !== "string" || typeof state !== "string" || typeof setupAction !== "string" ||
       !/^[1-9]\d{0,18}$/.test(installationId) ||
-      !/^[A-Za-z0-9_-]{43}$/.test(state) || setupAction !== "install") {
+      !/^[A-Za-z0-9_-]{43}$/.test(state) || (setupAction !== "install" && setupAction !== "update")) {
     return { valid: false };
   }
   try {
     const parsedInstallationId = BigInt(installationId);
     if (parsedInstallationId > 9_223_372_036_854_775_807n) return { valid: false };
   } catch { return { valid: false }; }
-  return { valid: true, installationId, state, setupAction: "install" };
+  return { valid: true, installationId, state, setupAction };
 }
 
 export function GitHubInstallationCallbackPage() {
   const api = useApi();
+  const navigate = useNavigate();
   const { account, loading } = useAuth();
   const [callback] = useState<CallbackParameters>(() => readCallbackParameters(window.location.search));
+  const [returnContext] = useState(() => readGitHubInstallationReturn());
   const [status, setStatus] = useState<"waiting" | "sending" | "connected" | "error" | "signed-out">("waiting");
   const [message, setMessage] = useState("");
   const [retryCount, setRetryCount] = useState(0);
@@ -99,5 +103,9 @@ export function GitHubInstallationCallbackPage() {
     {displayMessage && <div className={`alert ${displayStatus === "connected" ? "alert-success" : displayStatus === "error" || displayStatus === "signed-out" ? "alert-warning" : "alert-info"}`} role={displayStatus === "error" ? "alert" : "status"}>{displayMessage}</div>}
     {displayStatus === "error" && callback.valid && <button type="button" className="btn btn-outline-primary" onClick={retry}>Retry verification</button>}
     {displayStatus === "connected" && <p className="text-muted mb-0">CloudPilot confirmed the installation through GitHub and saved its organization association.</p>}
+    {displayStatus === "connected" && returnContext && <button type="button" className="btn btn-primary mt-3"
+      onClick={() => navigate(returnContext.projectPath, { replace: true })}>Continue to repository binding</button>}
+    {displayStatus === "connected" && !returnContext && <button type="button" className="btn btn-primary mt-3"
+      onClick={() => navigate("/projects", { replace: true })}>Return to projects</button>}
   </section></main>;
 }

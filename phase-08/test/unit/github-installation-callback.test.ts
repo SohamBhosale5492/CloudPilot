@@ -316,17 +316,48 @@ test("callback API requires exact fields and resolves the verified principal bef
     identity: { userId: "verified-sub", tenantId: "verified-tenant", roles: ["admin"] },
     async parseJsonBody() { return body; }, sendJson(status: number, responseBody: unknown) { result.status = status; result.body = responseBody; }
   }) as unknown as AuthenticatedRouteContext;
-  assert.equal(await routes.handle(request({ installationId, state, setupAction: "install", organizationId })), true);
-  assert.equal(result.status, 400);
-  assert.equal(observed.length, 0);
-  assert.equal(await routes.handle(request({ installationId, state, setupAction: "update" })), true);
-  assert.equal(result.status, 400);
-  assert.equal(await routes.handle(request({ installationId, state, setupAction: "install" })), true);
-  assert.deepEqual(observed, [
-    [{ issuer: "https://issuer.test", subject: "verified-sub" }, false],
-    { identityUserId: initiatorId, installationId, state }
-  ]);
-  assert.equal(result.status, 201);
+  // Extra fields rejected for both setupAction values
+  for (const setupAction of ["install", "update"] as const) {
+    assert.equal(await routes.handle(request({ installationId, state, setupAction, organizationId })), true);
+    assert.equal(result.status, 400);
+    assert.equal(observed.length, 0);
+  }
+
+  // Unsupported setupAction rejected
+  for (const badAction of ["reinstall", "delete", "request", "unknown", "", 123, null, undefined]) {
+    assert.equal(await routes.handle(request({ installationId, state, setupAction: badAction })), true);
+    assert.equal(result.status, 400);
+    assert.equal(observed.length, 0);
+  }
+
+  // Malformed installationId rejected for both actions
+  for (const setupAction of ["install", "update"] as const) {
+    for (const badId of ["not-a-number", "0", "-1", "99999999999999999999999", ""]) {
+      assert.equal(await routes.handle(request({ installationId: badId, state, setupAction })), true);
+      assert.equal(result.status, 400);
+      assert.equal(observed.length, 0);
+    }
+  }
+
+  // Malformed state rejected for both actions
+  for (const setupAction of ["install", "update"] as const) {
+    for (const badState of ["short", "x".repeat(42), "x".repeat(44), "x".repeat(42) + "!", ""]) {
+      assert.equal(await routes.handle(request({ installationId, state: badState, setupAction })), true);
+      assert.equal(result.status, 400);
+      assert.equal(observed.length, 0);
+    }
+  }
+
+  // Valid payload accepted for both update and install
+  for (const setupAction of ["update", "install"] as const) {
+    observed.length = 0;
+    assert.equal(await routes.handle(request({ installationId, state, setupAction })), true);
+    assert.deepEqual(observed, [
+      [{ issuer: "https://issuer.test", subject: "verified-sub" }, false],
+      { identityUserId: initiatorId, installationId, state }
+    ]);
+    assert.equal(result.status, 201);
+  }
 });
 
 test("callback API maps inactive identity and hides state or upstream details on persistence failure", async () => {
@@ -342,14 +373,17 @@ test("callback API maps inactive identity and hides state or upstream details on
     identity: { userId: "verified-sub", tenantId: "verified-tenant", roles: ["admin"] },
     parseJsonBody: resolve, sendJson(status: number, body: unknown) { result.status = status; result.body = body; }
   }) as unknown as AuthenticatedRouteContext;
-  await routes.handle(request(async () => ({ installationId, state, setupAction: "install" })));
-  assert.equal(result.status, 403);
-
   const activeResolver = { async resolve() { return { id: initiatorId, status: "active" }; } } as unknown as IdentityResolver;
   const failingRoutes = new GitHubInstallationCallbackApiRoutes(activeResolver, callback, { expectedIssuer: "https://issuer.test", allowFirstUseProvisioning: false });
-  await failingRoutes.handle(request(async () => ({ installationId, state, setupAction: "install" })));
-  assert.equal(result.status, 503);
-  assert.equal(JSON.stringify(result.body).includes(state), false);
+
+  for (const setupAction of ["install", "update"] as const) {
+    await routes.handle(request(async () => ({ installationId, state, setupAction })));
+    assert.equal(result.status, 403);
+
+    await failingRoutes.handle(request(async () => ({ installationId, state, setupAction })));
+    assert.equal(result.status, 503);
+    assert.equal(JSON.stringify(result.body).includes(state), false);
+  }
 });
 
 test("API authentication rejects a callback without a valid CloudPilot JWT before route execution", async () => {
@@ -362,11 +396,13 @@ test("API authentication rejects a callback without a valid CloudPilot JWT befor
   });
   const port = await api.start(0, "127.0.0.1");
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/v1/github/installations/callback`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ installationId, state, setupAction: "install" })
-    });
-    assert.equal(response.status, 401);
-    assert.equal(extensionCalls, 0);
+    for (const setupAction of ["install", "update"] as const) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/v1/github/installations/callback`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ installationId, state, setupAction })
+      });
+      assert.equal(response.status, 401);
+      assert.equal(extensionCalls, 0);
+    }
   } finally {
     await api.stop();
   }

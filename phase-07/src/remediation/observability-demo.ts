@@ -19,7 +19,7 @@ import {
   type InspectorConfiguration,
   type InspectorEvidence
 } from "../../../phase-01/demo-service/src/inspectors";
-import { isRemediationSupported, planRemediation } from "./planner";
+import { isRemediationSupported, planRemediation, resolveMetricTarget, type FindingSummary } from "./planner";
 
 export interface ObservabilityDemoInput {
   workloadRoot: string;
@@ -90,7 +90,7 @@ export async function runObservabilityDemo(input: ObservabilityDemoInput): Promi
   const generatedConfigurations = new Map<string, GeneratedConfiguration>();
   for (const finding of findings) {
     if (!isRemediationSupported(finding.signal, finding.outcome)) continue;
-    const patch = planRemediation({
+    const summary: FindingSummary = {
       requirementId: finding.requirementId,
       ruleId: finding.rule.id,
       ruleVersion: finding.rule.version,
@@ -99,10 +99,11 @@ export async function runObservabilityDemo(input: ObservabilityDemoInput): Promi
       expected: finding.expected,
       observed: finding.observed,
       reason: finding.reason
-    });
+    };
+    const patch = planRemediation(summary);
     const existing = generatedConfigurations.get(patch.filePath);
     const content = patch.applyPatch(existing?.content ?? patch.initialFileContent);
-    validateGeneratedYaml(content, finding.requirementId, finding.signal);
+    validateGeneratedYaml(content, summary);
     generatedConfigurations.set(patch.filePath, {
       filePath: patch.filePath,
       content,
@@ -148,16 +149,19 @@ async function inspectLabConfiguration(workloadRoot: string): Promise<LabConfigu
   return { prometheusJobs: prometheusJobs.sort(), collectorPipelines, diagnostics };
 }
 
-function validateGeneratedYaml(content: string, requirementId: string, signal: string): void {
+function validateGeneratedYaml(content: string, finding: FindingSummary): void {
   const document = YAML.parse(content);
   if (document === null || typeof document !== "object" || Array.isArray(document)) {
     throw new Error("Generated configuration root must be a mapping.");
   }
+  const { requirementId, signal } = finding;
   const key = signal === "metric" ? "metrics" : signal === "health" ? "health_checks" : "alerts";
   const entries = document[key];
-  const expectedEntry = signal === "health"
-    ? requirementId.replace(/[^a-zA-Z0-9_\-]/g, "-").toLowerCase()
-    : requirementId.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
+  const expectedEntry = signal === "metric"
+    ? resolveMetricTarget(finding).metricName
+    : signal === "health"
+      ? requirementId.replace(/[^a-zA-Z0-9_\-]/g, "-").toLowerCase()
+      : requirementId.replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase();
   if (!Array.isArray(entries) || !entries.some((entry) => Object.values(entry as Record<string, unknown>).includes(expectedEntry))) {
     throw new Error("Generated configuration does not contain the approved finding entry.");
   }

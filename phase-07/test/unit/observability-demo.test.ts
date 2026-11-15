@@ -62,6 +62,29 @@ test("end-to-end observability demo discovers, inspects, evaluates and validates
           if (url.pathname.endsWith("/api/traces")) {
             return Response.json({ data: [{ spans: [{ operationName: "GET /api/demo" }], processes: { p1: { serviceName: "demo-service" } } }] });
           }
+          if (url.pathname.endsWith("/api/v1/rules")) {
+            return Response.json({
+              status: "success",
+              data: {
+                groups: [
+                  {
+                    name: "cloudpilot_alerts",
+                    rules: [
+                      {
+                        name: "alerts",
+                        query: "rate > 0",
+                        health: "ok",
+                        state: "inactive",
+                        labels: { requirement_id: "alerts", severity: "warning" },
+                        alerts: [],
+                        type: "alerting"
+                      }
+                    ]
+                  }
+                ]
+              }
+            });
+          }
           if (url.pathname.endsWith("query_range")) {
             const start = Number(url.searchParams.get("start"));
             const end = Number(url.searchParams.get("end"));
@@ -88,7 +111,7 @@ test("end-to-end observability demo discovers, inspects, evaluates and validates
     assert.equal(report.findings.find((finding) => finding.requirementId === "traces")?.outcome, "pass");
     assert.equal(report.findings.find((finding) => finding.requirementId === "health")?.outcome, "pass");
     assert.equal(report.findings.find((finding) => finding.requirementId === "logs")?.outcome, "unknown");
-    assert.equal(report.findings.find((finding) => finding.requirementId === "alerts")?.outcome, "unknown");
+    assert.equal(report.findings.find((finding) => finding.requirementId === "alerts")?.outcome, "pass");
     assert.equal(report.generatedConfigurations.length, 1);
     assert.equal(report.generatedConfigurations[0].filePath, "config/observability/metrics.yaml");
     assert.equal(report.generatedConfigurations[0].validation, "valid");

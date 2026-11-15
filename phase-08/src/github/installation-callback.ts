@@ -243,7 +243,8 @@ export class PrismaGitHubInstallationCallbackStore implements GitHubInstallation
             accountType: input.installation.accountType,
             verifiedPermissionNames: Object.keys(input.installation.permissions).sort()
           } satisfies Prisma.InputJsonObject
-        }
+        },
+        select: { id: true }
       });
       return { installationRecordId: record.id, alreadyConnected: false };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }).catch((error: unknown) => {

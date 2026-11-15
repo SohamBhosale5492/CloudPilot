@@ -56,10 +56,32 @@ test("rejects mismatched IDs, malformed JSON, and malformed account fields", asy
     (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "invalid_response");
 });
 
+test("accepts required permissions with optional checks:read", async () => {
+  const permissionsWithChecks = {
+    ...GITHUB_APP_INSTALLATION_PERMISSIONS,
+    checks: "read"
+  };
+  const subject = verifier((async () => response({ permissions: permissionsWithChecks })) as typeof fetch);
+  const result = await subject.verify(INSTALLATION_ID);
+  assert.deepEqual(result, {
+    installationId: 12345678n,
+    accountId: 987654n,
+    accountLogin: "cloudpilot-org",
+    accountType: "Organization",
+    permissions: permissionsWithChecks
+  });
+});
+
 test("rejects suspended installations and missing, insufficient, or unexpected permissions", async () => {
   await assert.rejects(verifier((async () => response({ suspended_at: "2026-01-01T00:00:00Z" })) as typeof fetch).verify(INSTALLATION_ID),
     (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "installation_suspended");
   await assert.rejects(verifier((async () => response({ permissions: { metadata: "read" } })) as typeof fetch).verify(INSTALLATION_ID),
+    (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "insufficient_permissions");
+  await assert.rejects(verifier((async () => response({ permissions: { contents: "write", metadata: "read" } })) as typeof fetch).verify(INSTALLATION_ID),
+    (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "insufficient_permissions");
+  await assert.rejects(verifier((async () => response({ permissions: { ...GITHUB_APP_INSTALLATION_PERMISSIONS, contents: "read" } })) as typeof fetch).verify(INSTALLATION_ID),
+    (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "insufficient_permissions");
+  await assert.rejects(verifier((async () => response({ permissions: { ...GITHUB_APP_INSTALLATION_PERMISSIONS, checks: "write" } })) as typeof fetch).verify(INSTALLATION_ID),
     (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "insufficient_permissions");
   await assert.rejects(verifier((async () => response({ permissions: { ...GITHUB_APP_INSTALLATION_PERMISSIONS, administration: "write" } })) as typeof fetch).verify(INSTALLATION_ID),
     (error: unknown) => error instanceof GitHubInstallationVerificationError && error.code === "insufficient_permissions");

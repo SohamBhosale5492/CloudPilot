@@ -330,6 +330,10 @@ export class BoundedScanRunner {
         prometheusBaseUrl: typeof targetConfig.prometheusBaseUrl === "string" ? targetConfig.prometheusBaseUrl : undefined,
         healthBaseUrl: typeof targetConfig.healthBaseUrl === "string" ? targetConfig.healthBaseUrl : undefined,
         traceBackendUrl: typeof targetConfig.traceBackendUrl === "string" ? targetConfig.traceBackendUrl : undefined,
+        logBackendUrl: typeof targetConfig.logBackendUrl === "string" ? targetConfig.logBackendUrl : undefined,
+        alertBackendUrl: typeof targetConfig.alertBackendUrl === "string" ? targetConfig.alertBackendUrl : undefined,
+        // Evaluate Prometheus increase() over a 5m scan window rather than Phase 01's 60s library default.
+        collectionWindowSeconds: 300,
         metricConfigs: effectiveMetricConfigs as InspectorConfiguration["metricConfigs"],
         fetchImpl: (input, init) => telemetryFetch(input, {
           ...init,

@@ -33,6 +33,7 @@ describe("TelemetryTargetConfigPanel", () => {
   it("blocks unsupported telemetry targets and does not offer editing to viewers", () => {
     render(<TelemetryTargetConfigPanel projectId="p1" current={null} expectedModel={null} canUpdate={false} onSaved={() => undefined} />);
     expect(screen.queryByRole("button", { name: "Edit telemetry targets" })).not.toBeInTheDocument();
-    expect(screen.getByText(/Traces, logs, and alerts do not have configured live inspectors/)).toBeInTheDocument();
+    expect(screen.getByText(/Logs and alerts remain unknown unless an inspector is configured/)).toBeInTheDocument();
+    expect(screen.getByText("Your role cannot change project telemetry targets.")).toBeInTheDocument();
   });
 });

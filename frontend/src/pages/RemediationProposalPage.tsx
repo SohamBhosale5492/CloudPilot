@@ -49,19 +49,20 @@ export function RemediationProposalPage() {
     {!current && <Loading label="Loading proposal" />}
     {current?.error && <ErrorState error={current.error} onRetry={() => void reload()} />}
     {proposal && <section className="card-surface detail-card" aria-label="Proposal details">
-      <p><strong>Approval:</strong> {proposal.approvalState} · <strong>Lifecycle:</strong> {proposal.status}</p>
+      <p><strong>Approval:</strong> {proposal.approvalState} · <strong>Lifecycle:</strong> {proposal.status} · <strong>PR delivery:</strong> {proposal.prDeliveryStatus ?? (proposal.status === "merged" ? "pr_merged" : proposal.status === "open" ? "draft_pr_created" : proposal.status === "closed" ? "pr_closed" : "not_started")} · <strong>Finding resolution:</strong> {proposal.findingResolution?.status ?? "unverified"}{proposal.findingResolution?.latestOutcome ? ` (latest scan outcome: ${proposal.findingResolution.latestOutcome})` : " (awaiting subsequent scan)"}</p>
       <dl className="detail-grid">
         <dt>Proposal</dt><dd>{proposal.id}</dd><dt>Project</dt><dd><Link to={`/projects/${encodeURIComponent(proposal.projectId)}`}>{proposal.projectId}</Link></dd>
         <dt>Finding</dt><dd>{proposal.findingId}</dd><dt>Repository ID</dt><dd>{proposal.githubRepositoryId}</dd>
         <dt>Plan hash</dt><dd><code>{proposal.planHash}</code></dd><dt>Created</dt><dd>{formatDate(proposal.createdAt)}</dd>
         {proposal.approvedAt && <><dt>Approved</dt><dd>{formatDate(proposal.approvedAt)}</dd></>}
+        {proposal.invalidatedAt && <><dt>Invalidated</dt><dd>{formatDate(proposal.invalidatedAt)}</dd></>}
         {proposal.executionArtifact && <><dt>Artifact hash</dt><dd><code>{proposal.executionArtifact.artifactHash}</code></dd>
           <dt>Approved base</dt><dd>{proposal.executionArtifact.baseRef} @ <code>{proposal.executionArtifact.baseCommitSha}</code></dd>
           <dt>Artifact path</dt><dd><code>{proposal.executionArtifact.filePath}</code></dd></>}
       </dl>
       {plan && <details><summary>Review persisted plan</summary><pre className="evidence-json">{formatJson(plan)}</pre></details>}
       {proposal.execution && <div className="alert alert-secondary mt-3" role="status">
-        <strong>Execution state:</strong> {proposal.execution.status} · stage {proposal.execution.stage ?? "—"} · attempt {proposal.execution.attemptNumber}
+        <strong>Execution state:</strong> {proposal.execution.status} · stage {proposal.execution.stage ?? "—"} · attempt {proposal.execution.attemptNumber}{proposal.execution.status === "completed" ? " (Draft PR delivered — finding resolution requires a subsequent passing scan)" : ""}
         {proposal.execution.commitSha && <div>Verified commit: <code>{proposal.execution.commitSha}</code></div>}
         {proposal.execution.branchName && <div>Branch: <code>{proposal.execution.branchName}</code></div>}
         {proposal.execution.pullRequestUrl && <div>Pull request: <a href={proposal.execution.pullRequestUrl} target="_blank" rel="noreferrer">#{proposal.execution.pullRequestNumber ?? "—"}</a></div>}
@@ -76,6 +77,7 @@ export function RemediationProposalPage() {
           onClick={() => void runAction("reject")}>{action === "reject" ? "Rejecting…" : "Reject proposal"}</button>}
       </div>}
       {proposal.approvalState === "approved" && <div className="alert alert-info mt-3" role="status">Approved artifact is persisted. Background remediation execution is disabled in this release.</div>}
+      {proposal.approvalState === "invalidated" && <div className="alert alert-warning mt-3" role="alert"><strong>Proposal invalidated.</strong> {proposal.invalidationReason ?? "This proposal is stale and can no longer be approved."}</div>}
       {message && <div className="alert alert-secondary mt-3" role="status">{message}</div>}
     </section>}
     <p className="back-link"><Link to="/findings">Back to findings</Link></p>

@@ -3,6 +3,22 @@ import { describe, expect, it, vi } from "vitest";
 import { CloudPilotApi, createApiClient } from "./client";
 
 describe("API client", () => {
+  it("lists remediation proposals for a project with optional cursor", async () => {
+    const requests: Array<{ method: string; url: string; params: unknown }> = [];
+    const adapter: AxiosAdapter = async (config) => ({
+      data: { items: [], hasMore: false },
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config: (requests.push({ method: config.method ?? "", url: config.url ?? "", params: config.params }), config)
+    });
+    const api = new CloudPilotApi(createApiClient("/", async () => "token", adapter));
+    await api.listRemediationProposals("project/1", { cursor: "cursor-1" });
+    expect(requests).toEqual([
+      { method: "get", url: "/api/v1/projects/project%2F1/remediation-proposals", params: { cursor: "cursor-1" } }
+    ]);
+  });
+
   it("acquires a bearer token for each request without storing it in the client", async () => {
     const getToken = vi.fn(async () => "mock-access-token");
     let sentAuthorization: unknown;
@@ -94,10 +110,53 @@ describe("API client", () => {
       config: (requestUrl = config.url ?? "", requestBody = JSON.parse(String(config.data)), config)
     });
     const api = new CloudPilotApi(createApiClient("/", async () => "token", adapter));
-    const callback = { installationId: "123", state: "A".repeat(43), setupAction: "install" as const };
-    await api.completeGitHubInstallation(callback);
-    expect(requestUrl).toBe("/api/v1/github/installations/callback");
-    expect(requestBody).toEqual(callback);
+    for (const setupAction of ["install", "update"] as const) {
+      const callback = { installationId: "123", state: "A".repeat(43), setupAction };
+      await api.completeGitHubInstallation(callback);
+      expect(requestUrl).toBe("/api/v1/github/installations/callback");
+      expect(requestBody).toEqual(callback);
+    }
+  });
+
+  it("starts an organization GitHub installation with an empty authenticated request body", async () => {
+    let requestUrl = "";
+    let requestBody: unknown;
+    let authorization: unknown;
+    const adapter: AxiosAdapter = async (config) => ({
+      data: { intentId: "intent-1", state: "s".repeat(43), installationUrl: "https://github.com/apps/cloudpilot/installations/new?state=" + "s".repeat(43), expiresAt: "2026-11-13T00:10:00Z" },
+      status: 201, statusText: "Created", headers: {},
+      config: (requestUrl = config.url ?? "", requestBody = JSON.parse(String(config.data)),
+        authorization = config.headers.get("Authorization"), config)
+    });
+    const api = new CloudPilotApi(createApiClient("/", async () => "session-token", adapter));
+
+    const result = await api.startGitHubInstallation("org/1");
+
+    expect(requestUrl).toBe("/api/v1/organizations/org%2F1/github/installations/start");
+    expect(requestBody).toEqual({});
+    expect(authorization).toBe("Bearer session-token");
+    expect(result.intentId).toBe("intent-1");
+  });
+
+  it("creates an organization with the backend idempotency key through the authenticated client", async () => {
+    let requestUrl = "";
+    let requestBody: unknown;
+    let idempotencyKey: unknown;
+    let authorization: unknown;
+    const adapter: AxiosAdapter = async (config) => ({
+      data: { organization: { id: "org-1" }, membership: { role: "owner", status: "active" } },
+      status: 201, statusText: "Created", headers: {},
+      config: (requestUrl = config.url ?? "", requestBody = JSON.parse(String(config.data)),
+        idempotencyKey = config.headers.get("Idempotency-Key"), authorization = config.headers.get("Authorization"), config)
+    });
+    const api = new CloudPilotApi(createApiClient("/", async () => "session-token", adapter));
+
+    await api.createOrganization("Example Org", "request-123");
+
+    expect(requestUrl).toBe("/api/v1/organizations");
+    expect(requestBody).toEqual({ displayName: "Example Org" });
+    expect(idempotencyKey).toBe("request-123");
+    expect(authorization).toBe("Bearer session-token");
   });
 
   it("uses the approved persisted proposal and artifact review routes", async () => {
@@ -118,6 +177,41 @@ describe("API client", () => {
       { method: "post", url: "/api/v1/projects/project%2F1/remediation-proposals", body: { findingId: "finding-1" } },
       { method: "post", url: "/api/v1/remediation-proposals/proposal%2F1/prepare-artifact", body: {} },
       { method: "post", url: "/api/v1/remediation-proposals/proposal%2F1/approve", body: null }
+    ]);
+  });
+
+  it("requests and approves project adoption through authenticated organization routes", async () => {
+    const requests: Array<{ method: string; url: string; body: unknown; idempotencyKey: unknown }> = [];
+    const adapter: AxiosAdapter = async (config) => ({
+      data: config.url?.endsWith("/approve")
+        ? { adoption: { id: "adopt-1", status: "approved" } }
+        : { adoption: { id: "adopt-1", status: "pending", projectId: "project-1" }, replayed: false },
+      status: config.url?.endsWith("/approve") ? 200 : 202,
+      statusText: "OK",
+      headers: {},
+      config: (requests.push({
+        method: config.method ?? "",
+        url: config.url ?? "",
+        body: JSON.parse(String(config.data)),
+        idempotencyKey: config.headers.get("Idempotency-Key")
+      }), config)
+    });
+    const api = new CloudPilotApi(createApiClient("/", async () => "token", adapter));
+    await api.requestProjectAdoption("org/1", "project-1", "adopt-key-1");
+    await api.decideProjectAdoption("org/1", "adopt/1", "project-1", "approve");
+    expect(requests).toEqual([
+      {
+        method: "post",
+        url: "/api/v1/organizations/org%2F1/project-adoptions",
+        body: { projectId: "project-1" },
+        idempotencyKey: "adopt-key-1"
+      },
+      {
+        method: "post",
+        url: "/api/v1/organizations/org%2F1/project-adoptions/adopt%2F1/approve",
+        body: { projectId: "project-1" },
+        idempotencyKey: undefined
+      }
     ]);
   });
 });

@@ -27,13 +27,20 @@ class ProposalStore implements RemediationProposalStore {
     this.calls.push({ method: "create", input });
     return { replayed: false, proposal: { id: "proposal-1", approvalState: "pending", status: "pending_approval", planHash: "a".repeat(64) } };
   }
+  async listByProject(input: Parameters<RemediationProposalStore["listByProject"]>[0]) {
+    this.calls.push({ method: "listByProject", input });
+    return {
+      items: [{ id: "proposal-1", projectId: input.projectId, findingId: "22222222-2222-4222-8222-222222222222", approvalState: "pending", status: "pending_approval", planHash: "a".repeat(64), createdAt: "2026-01-01T00:00:00.000Z" }],
+      hasMore: false
+    };
+  }
   async read(input: Parameters<RemediationProposalStore["read"]>[0]) {
     this.calls.push({ method: "read", input });
     return { id: input.remediationId, approvalState: "pending", planHash: "a".repeat(64) };
   }
   async decide(input: Parameters<RemediationProposalStore["decide"]>[0]): ReturnType<RemediationProposalStore["decide"]> {
     this.calls.push({ method: input.decision, input });
-    return { kind: "decided" as const, approvalState: input.decision === "approve" ? "approved" as const : "rejected" as const, status: "pending_approval" };
+    return { kind: "decided" as const, approvalState: input.decision === "approve" ? "approved" as const : "rejected" as const, status: input.decision === "approve" ? "pending" : "pending_approval" };
   }
 }
 
@@ -106,4 +113,42 @@ test("artifact preparation route accepts persisted proposal identity only and re
   assert.equal(await routes.handle(viewer.value), true);
   assert.equal(viewer.response.status, 403);
   assert.equal(prepared.length, 1);
+});
+
+
+test("project proposal list route enforces remediation:read, validates params, and preserves tenant isolation", async () => {
+  const store = new ProposalStore();
+  let resolves = 0;
+  const identities = { async resolve() { resolves++; return { id: "local-reader" }; } };
+  const routes = new RemediationProposalApiRoutes(identities as never, store, { expectedIssuer: issuer });
+  const projectId = "11111111-1111-4111-8111-111111111111";
+  const cursorId = "77777777-7777-4777-8777-777777777777";
+
+  const allowed = context("GET", `/api/v1/projects/${projectId}/remediation-proposals?limit=10&cursor=${cursorId}`, identity("viewer"));
+  assert.equal(await routes.handle(allowed.value), true);
+  assert.equal(allowed.response.status, 200);
+  assert.equal((allowed.response.body as { items: Array<{ status: string }> }).items[0]?.status, "pending_approval");
+  assert.equal(resolves, 1);
+  assert.deepEqual(store.calls[0], {
+    method: "listByProject",
+    input: { tenantId: "verified-tenant", projectId, identityUserId: "local-reader", limit: 10, cursor: cursorId }
+  });
+
+  const denied = context("GET", `/api/v1/projects/${projectId}/remediation-proposals`, { userId: "verified-subject", tenantId: "verified-tenant", roles: [] });
+  assert.equal(await routes.handle(denied.value), true);
+  assert.equal(denied.response.status, 403);
+
+  const badProject = context("GET", "/api/v1/projects/not-a-uuid/remediation-proposals", identity("viewer"));
+  assert.equal(await routes.handle(badProject.value), true);
+  assert.equal(badProject.response.status, 400);
+
+  const badCursor = context("GET", `/api/v1/projects/${projectId}/remediation-proposals?cursor=not-a-uuid`, identity("viewer"));
+  assert.equal(await routes.handle(badCursor.value), true);
+  assert.equal(badCursor.response.status, 400);
+
+  const badLimit = context("GET", `/api/v1/projects/${projectId}/remediation-proposals?limit=500`, identity("viewer"));
+  assert.equal(await routes.handle(badLimit.value), true);
+  assert.equal(badLimit.response.status, 400);
+
+  assert.equal(store.calls.length, 1);
 });

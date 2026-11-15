@@ -24,9 +24,13 @@ Phase 07 implements automated, explainable remediation via GitHub sandbox branch
 ## Security & Operational Controls
 
 ### 1. Minimal Allowlisted Patching (D-002, D-003)
-- Only verified gap findings for allowlisted observability signals (`metric`, `health`, `alert`) produce remediation patches.
-- Unsupported signals (`trace`, `log`) and non-gap outcomes (`pass`, `unknown`, `inconclusive`) are safely skipped with explicit audit attribution.
-- No arbitrary code or command execution is permitted. File modification is strictly restricted to designated observability configuration paths.
+- Only verified gap findings for allowlisted observability signals (`metric`, `health`, `alert`, `trace`) produce remediation patches.
+- Unsupported signals (`log`) and non-gap outcomes (`pass`, `unknown`, `inconclusive`) are safely skipped with explicit audit attribution.
+- No arbitrary code or command execution is permitted. File modification is strictly restricted to designated observability configuration paths (`config/observability/metrics.yaml`, `config/observability/health-checks.yaml`, `config/observability/alert-rules.yaml`, `config/observability/tracing.yaml`).
+- For the `demo-service` workflow, `config/observability/metrics.yaml` (`phase-01/demo-service/src/metrics-config.ts`), `config/observability/health-checks.yaml` (`phase-01/demo-service/src/health-config.ts`), and `config/observability/tracing.yaml` (`phase-01/demo-service/src/tracing-config.ts`) are consumed at runtime by `demo-service`.
+- `config/observability/alert-rules.yaml` generates validated Prometheus `groups[].rules[]` YAML (`validatePrometheusAlertRulesYaml` / `patchPrometheusAlertRulesYaml`), is mounted into Prometheus (`/etc/prometheus/rules/alert-rules.yaml`), and is verified at runtime by `inspectAlert` querying `/api/v1/rules?type=alert` and `evaluateAlertGap` checking loaded rule presence and `health === "ok"`.
+- `trace` remediation patches `config/observability/tracing.yaml` (`validateTracingConfigYaml` / `patchTracingYaml`) and is verified at runtime by `inspectTrace` querying Jaeger `/api/traces`; `log` is inspected via Grafana Loki (`inspectLog` querying `/loki/api/v1/query_range`) but remains unsupported by the remediation planner (`UnsupportedFindingError`).
+- PR delivery (`draft_pr_created`, `pr_merged`) is tracked separately from actual finding resolution: a finding is marked `resolved` only after a subsequent completed scan reports `outcome = "pass"` with live telemetry evidence.
 
 ### 2. Path Traversal & Sandbox Protection
 - All repository paths, branch names, and repository identifiers are strictly validated against strict regex allowlists before network dispatch.

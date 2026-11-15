@@ -134,7 +134,7 @@ test("application host connects and starts once, then gracefully stops and disco
     async start() { calls.start++; return 43210; },
     async stop() { calls.stop++; }
   };
-  const host = new CloudPilotApplicationHost(database, api, 3000, true);
+  const host = new CloudPilotApplicationHost(database, api, 3000, false);
   const ports = await Promise.all([host.start(), host.start()]);
   assert.deepEqual(ports, [43210, 43210]);
   assert.deepEqual(calls, { connect: 1, verify: 1, disconnect: 0, start: 1, stop: 0 });
@@ -166,7 +166,7 @@ test("host keeps Prisma connected until API and worker shutdown finish", async (
   }, {
     async start() { calls.push("listen"); return 3000; },
     async stop() { calls.push("worker-stop-start"); await apiStopGate; calls.push("worker-stop-finished"); }
-  }, 3000, true);
+  }, 3000, false);
   await host.start();
   const stopping = host.stop();
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -187,7 +187,7 @@ test("database or worker startup failure rejects startup and closes the API/data
     async start() { calls.start++; return 3000; },
     async stop() { calls.stop++; }
   };
-  const host = new CloudPilotApplicationHost(database, api, 3000, true);
+  const host = new CloudPilotApplicationHost(database, api, 3000, false);
   await assert.rejects(host.start(), /CloudPilot host startup failed/);
   assert.deepEqual(calls, { connect: 1, verify: 1, disconnect: 1, start: 0, stop: 1 });
 
@@ -197,7 +197,7 @@ test("database or worker startup failure rejects startup and closes the API/data
   }, {
     async start() { throw new Error("worker initialization failed"); },
     async stop() { startupCalls.apiStop++; }
-  }, 3000, true);
+  }, 3000, false);
   await assert.rejects(failingHost.start(), /CloudPilot host startup failed/);
   assert.deepEqual(startupCalls, { apiStop: 1, disconnect: 1 });
 });
@@ -222,6 +222,9 @@ test("CloudPilotApiServer initializes its worker extension exactly once and shut
   });
   const ports = await Promise.all([server.start(0), server.start(0)]);
   assert.equal(ports[0], ports[1]);
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  const liveness = await fetch(`http://127.0.0.1:${ports[0]}/health/liveness`, { headers: { connection: "close" } });
+  assert.equal(liveness.status, 200);
   assert.deepEqual(calls, { scanInit: 1, scanStop: 0, workerInit: 1, workerStop: 0 });
   await Promise.all([server.stop(), server.stop()]);
   assert.deepEqual(calls, { scanInit: 1, scanStop: 1, workerInit: 1, workerStop: 1 });

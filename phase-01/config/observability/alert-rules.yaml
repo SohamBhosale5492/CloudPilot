@@ -1,0 +1,12 @@
+# cloudpilot:alerts
+groups:
+  - name: cloudpilot_alerts
+    rules:
+      - alert: demo_heartbeat_alert
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: warning
+          requirement_id: demo-heartbeat-alert
+        annotations:
+          summary: "CloudPilot demo target is down"

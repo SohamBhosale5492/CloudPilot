@@ -18,6 +18,7 @@ import type {
 import type { EvaluationOutcome, RequestMetricRequirement, TelemetryEvidence } from "./evaluation";
 import { evaluateRequestMetricRequirement } from "./evaluation";
 import type {
+  AlertEvidenceData,
   HealthEvidenceData,
   InspectorEvidence,
   InspectorProvenance,
@@ -150,11 +151,11 @@ export function evaluateGap(
     case "health":
       return evaluateHealthGap(requirement, evidence, config.maxHealthEvidenceAgeMs, evaluatedAt);
     case "log":
-      return evaluateUnconfiguredSignalGap(requirement, evidence, logGapRule);
+      return evaluateLogGap(requirement, evidence);
     case "trace":
       return evaluateTraceGap(requirement, evidence);
     case "alert":
-      return evaluateUnconfiguredSignalGap(requirement, evidence, alertGapRule);
+      return evaluateAlertGap(requirement, evidence);
     default: {
       const req = requirement as { id?: string; signal?: unknown };
       return {
@@ -479,6 +480,80 @@ function evaluateUnconfiguredSignalGap(
   };
 }
 
+function isLogEvidence(value: unknown): value is import("./inspectors").LogEvidenceData {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as import("./inspectors").LogEvidenceData;
+  return (
+    Number.isInteger(candidate.totalEntries) &&
+    candidate.totalEntries >= 0 &&
+    Number.isInteger(candidate.validJsonEntries) &&
+    candidate.validJsonEntries >= 0 &&
+    Array.isArray(candidate.observedFields) &&
+    Array.isArray(candidate.missingFields)
+  );
+}
+
+function evaluateLogGap(requirement: ExpectedLogRequirement, evidence: InspectorEvidence): GapFinding {
+  const base = findingBase(logGapRule, requirement.id, "log", evidence.provenance);
+  const expected = `Loki contains structured JSON logs with required fields: ${requirement.fields.join(", ") || "none"}.`;
+
+  if (!evidence.available) {
+    const hasUnconfiguredDiagnostic = evidence.diagnostics.some((d) => d.code === "BACKEND_UNCONFIGURED");
+    return {
+      ...base,
+      outcome: "unknown",
+      expected,
+      observed: hasUnconfiguredDiagnostic
+        ? "Log backend adapter is not configured in this environment."
+        : "Loki log evidence is unavailable.",
+      reason: hasUnconfiguredDiagnostic
+        ? "No log backend is configured. Configure Loki to enable structured log verification."
+        : "Missing Loki response cannot confirm whether structured logs are being ingested."
+    };
+  }
+
+  if (!evidence.complete || !isLogEvidence(evidence.data)) {
+    return {
+      ...base,
+      outcome: "inconclusive",
+      expected,
+      observed: "Loki returned incomplete or malformed log evidence.",
+      reason: "Incomplete Loki log responses cannot support a pass or gap verdict."
+    };
+  }
+
+  if (evidence.data.totalEntries === 0) {
+    return {
+      ...base,
+      outcome: "gap",
+      expected,
+      observed: "Loki query returned 0 log entries in the lookback window.",
+      reason: "A complete Loki query confirmed no logs were ingested for this service."
+    };
+  }
+
+  if (evidence.data.validJsonEntries === 0 || evidence.data.missingFields.length > 0) {
+    return {
+      ...base,
+      outcome: "gap",
+      expected,
+      observed:
+        evidence.data.validJsonEntries === 0
+          ? `Loki returned ${evidence.data.totalEntries} log entries, but none were valid structured JSON.`
+          : `Loki logs are missing required field(s): ${evidence.data.missingFields.join(", ")}.`,
+      reason: "Structured JSON log validation against required fields failed."
+    };
+  }
+
+  return {
+    ...base,
+    outcome: "pass",
+    expected,
+    observed: `Loki returned ${evidence.data.validJsonEntries} valid structured JSON log(s) containing all required fields (${requirement.fields.join(", ")}).`,
+    reason: "A complete Loki query confirmed structured JSON log ingestion with all required fields."
+  };
+}
+
 function evaluateTraceGap(requirement: ExpectedTraceRequirement, evidence: InspectorEvidence): GapFinding {
   const base = findingBase(traceGapRule, requirement.id, "trace", evidence.provenance);
   const expected = `Jaeger contains at least one recent trace for service '${requirement.serviceName}'.`;
@@ -510,6 +585,83 @@ function isTraceEvidence(value: unknown): value is TraceEvidenceData {
   return typeof value === "object" && value !== null &&
     typeof (value as TraceEvidenceData).serviceName === "string" &&
     Number.isInteger((value as TraceEvidenceData).traceCount) && (value as TraceEvidenceData).traceCount >= 0;
+}
+
+function isAlertEvidence(value: unknown): value is AlertEvidenceData {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as AlertEvidenceData;
+  return (
+    Array.isArray(candidate.matchedRules) &&
+    Number.isInteger(candidate.totalLoadedRules) &&
+    candidate.totalLoadedRules >= 0 &&
+    typeof candidate.ruleHealthy === "boolean"
+  );
+}
+
+function evaluateAlertGap(requirement: ExpectedAlertRequirement, evidence: InspectorEvidence): GapFinding {
+  const base = findingBase(alertGapRule, requirement.id, "alert", evidence.provenance);
+  const expected = `Prometheus has a healthy loaded alerting rule matching requirement '${requirement.id}' (severity=${requirement.severity}).`;
+
+  if (!evidence.available) {
+    const hasUnconfiguredDiagnostic = evidence.diagnostics.some((d) => d.code === "BACKEND_UNCONFIGURED");
+    return {
+      ...base,
+      outcome: "unknown",
+      expected,
+      observed: hasUnconfiguredDiagnostic
+        ? "Alert backend adapter is not configured in this environment."
+        : "Prometheus alert rules evidence is unavailable.",
+      reason: hasUnconfiguredDiagnostic
+        ? "No alert backend is configured. Configure Prometheus to enable alert rule verification."
+        : "Missing Prometheus rules response cannot confirm whether the alerting rule is loaded."
+    };
+  }
+
+  if (!evidence.complete || !isAlertEvidence(evidence.data)) {
+    return {
+      ...base,
+      outcome: "inconclusive",
+      expected,
+      observed: "Prometheus returned incomplete or malformed alert rule evidence.",
+      reason: "Incomplete alert rule responses cannot support a pass or gap verdict."
+    };
+  }
+
+  if (evidence.data.matchedRules.length === 0) {
+    return {
+      ...base,
+      outcome: "gap",
+      expected,
+      observed: `Prometheus loaded ${evidence.data.totalLoadedRules} alerting rule(s), but none match '${requirement.id}'.`,
+      reason: "A complete Prometheus /api/v1/rules query confirmed no matching alerting rule is loaded."
+    };
+  }
+
+  if (!evidence.data.ruleHealthy) {
+    const names = evidence.data.matchedRules.map((r) => `${r.name}(health=${r.health})`).join(", ");
+    return {
+      ...base,
+      outcome: "gap",
+      expected,
+      observed: `Matching Prometheus alerting rule(s) reported unhealthy evaluation: ${names}.`,
+      reason: "Prometheus /api/v1/rules reported an evaluation error for the matching alerting rule."
+    };
+  }
+
+  const firingCount = evidence.data.firingAlertCount ?? evidence.data.matchedRules.reduce((sum, r) => sum + (r.activeAlerts ?? 0), 0);
+  const summary = evidence.data.matchedRules
+    .map((r) => `${r.name}(state=${r.state},health=${r.health},firing=${r.activeAlerts ?? 0})`)
+    .join(", ");
+  return {
+    ...base,
+    outcome: "pass",
+    expected,
+    observed: `Prometheus loaded ${evidence.data.matchedRules.length} healthy alerting rule(s) (${firingCount} firing): ${summary}.`,
+    reason:
+      firingCount > 0
+        ? "Prometheus /api/v1/rules confirmed the alerting rule is loaded, healthy, and currently firing."
+        : "Prometheus /api/v1/rules confirmed the alerting rule is loaded and evaluating cleanly (inactive)."
+  };
 }
 
 // ─── Private helpers ───────────────────────────────────────────────────────────

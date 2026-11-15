@@ -179,13 +179,23 @@ function validateInstallation(value: unknown, expectedId: bigint): VerifiedGitHu
   };
 }
 
+const OPTIONAL_INSTALLATION_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({
+  checks: "read"
+});
+
 function hasRequiredPermissions(value: unknown): value is Record<string, string> {
   if (!isRecord(value)) return false;
-  const required = GITHUB_APP_INSTALLATION_PERMISSIONS;
-  const keys = Object.keys(value).sort();
-  const expectedKeys = Object.keys(required).sort();
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) return false;
-  return Object.entries(required).every(([name, permission]) => value[name] === permission);
+  const required: Readonly<Record<string, string>> = GITHUB_APP_INSTALLATION_PERMISSIONS;
+  for (const [name, permission] of Object.entries(required)) {
+    if (value[name] !== permission) return false;
+  }
+  for (const [name, permission] of Object.entries(value)) {
+    if (Object.hasOwn(required, name)) continue;
+    if (!Object.hasOwn(OPTIONAL_INSTALLATION_PERMISSIONS, name) || OPTIONAL_INSTALLATION_PERMISSIONS[name] !== permission) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function statusError(status: number): GitHubInstallationVerificationError {

@@ -90,7 +90,8 @@ function setup(options: { sourceExists?: boolean; sourceContent?: string; baseRe
   rateLimitPost?: "blob" | "tree" | "commit"; rateLimitRef?: boolean; forbiddenRef?: boolean;
   rateLimitRetryAfterSeconds?: number; retriesLeft?: number;
   invalidateLeaseAfterBranch?: boolean; invalidateLeaseOnPrCreate?: boolean; invalidateBeforePrCreate?: boolean;
-  invalidateLeaseBeforeClose?: boolean } = {}) {
+  invalidateLeaseBeforeClose?: boolean; now?: () => number } = {}) {
+  const clock = options.now ?? Date.now;
   const selectedArtifact = options.operation === "create" ? createArtifact : artifact;
   const writtenContent = selectedArtifact.artifact.renderedContent;
   const writtenBlobSha = gitBlobSha(writtenContent);
@@ -367,15 +368,16 @@ function setup(options: { sourceExists?: boolean; sourceContent?: string; baseRe
   });
   const tokens = { async getArtifactWriterInstallationToken(input: { installationId: string; repositoryId: string }): Promise<GitHubInstallationToken> {
     tokenCalls++; assert.equal(input.installationId, s.installation); assert.equal(input.repositoryId, s.repo);
-    return { token: "secret-test-token", expiresAt: new Date(Date.now() + 60_000).toISOString(), installationId: s.installation,
+    return { token: "secret-test-token", expiresAt: new Date(clock() + 60_000).toISOString(), installationId: s.installation,
       repositoryId: s.repo, permissions: GITHUB_ARTIFACT_WRITER_PERMISSIONS };
   }, async getDraftPullRequestInstallationToken(input: { installationId: string; repositoryId: string }): Promise<GitHubInstallationToken> {
     assert.equal(input.installationId, s.installation); assert.equal(input.repositoryId, s.repo);
-    return { token: "secret-test-pr-token", expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    return { token: "secret-test-pr-token", expiresAt: new Date(clock() + 60_000).toISOString(),
       installationId: s.installation, repositoryId: s.repo, permissions: GITHUB_DRAFT_PR_PERMISSIONS };
   }, invalidate() {} };
   const contexts = new TrustedClaimExecutionContextService(prisma);
-  const capabilities = new GitHubExecutionCapabilityService(contexts, tokens, { clientOptions: { fetchImpl } });
+  const capabilities = new GitHubExecutionCapabilityService(contexts, tokens, { clientOptions: { fetchImpl },
+    ...(options.now ? { now: options.now } : {}) });
   return { db, calls, journal, tokenCalls: () => tokenCalls, capabilities, contexts, persistence,
     setAuditFailure(value: boolean) { failAuditWrites = value; },
     setBaseRefSha(value: string) { currentBaseSha = value; },
@@ -994,4 +996,199 @@ test("writer and orchestrator propagate rate-limit retryAfterMs on read and writ
   });
   assert.equal(commitLimited.journal.filter((event) => event.eventType === "remote_mutation_rejected").length, 1);
   assert.equal(commitLimited.journal.find((event) => event.eventType === "remote_mutation_rejected")?.stage, "commit");
+});
+
+test("orchestrator completes end-to-end execution when worker lease expiry is monotonically renewed mid-execution", async () => {
+  const h = setup();
+  const baseWriter = new ArtifactOnlyGitHubWriter(h.capabilities);
+  const basePublisher = new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities);
+  let renewals = 0;
+  const orchestrator = new ArtifactOnlyExecutionOrchestrator(
+    h.contexts,
+    h.capabilities,
+    {
+      async write(input) {
+        renewals++;
+        h.db.remediation.leaseExpiresAt = new Date(h.db.remediation.leaseExpiresAt.getTime() + 15_000);
+        return baseWriter.write(input);
+      }
+    },
+    {
+      async publish(input) {
+        renewals++;
+        h.db.remediation.leaseExpiresAt = new Date(h.db.remediation.leaseExpiresAt.getTime() + 15_000);
+        return basePublisher.publish(input);
+      }
+    },
+    h.persistence
+  );
+  const outcome = await orchestrator.execute(lease);
+  assert.equal(outcome.kind, "draft_pull_request", JSON.stringify(outcome));
+  assert.equal(renewals, 2);
+});
+
+test("writer and draft PR publisher classify pre-mutation invalid_token as lease_lost", async () => {
+  // 1. Writer pre-mutation invalid_token -> lease_lost
+  {
+    const h = await run();
+    // Mutate leaseToken after capability issuance so #beforeRequest leaseGuard fails with invalid_token before any GitHub mutation
+    h.db.remediation.leaseToken = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const result = await h.writer.write({
+      context: h.context,
+      capability: h.capability,
+      leaseGuard: h.guard,
+      executionSession: h.executionSession
+    });
+    assert.deepEqual(result, { kind: "failed", code: "lease_lost" });
+  }
+
+  // 2. Draft PR publisher pre-mutation invalid_token -> lease_lost
+  {
+    const h = await run();
+    const writeResult = await h.writer.write({
+      context: h.context,
+      capability: h.capability,
+      leaseGuard: h.guard,
+      executionSession: h.executionSession
+    });
+    assert.ok(isVerifiedArtifactOnlyGitHubWriteResult(writeResult, h.capability));
+
+    // Mutate leaseToken after write so #beforeRequest leaseGuard fails with invalid_token before PR creation
+    h.db.remediation.leaseToken = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const publisher = new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities);
+    const publishResult = await publisher.publish({
+      writeResult,
+      capability: h.capability,
+      leaseGuard: h.guard,
+      executionSession: h.executionSession
+    });
+    assert.deepEqual(publishResult, { kind: "failed", code: "lease_lost" });
+  }
+});
+
+test("PR capability issuance failure after this call created the branch is manual review, not a retryable failure", async () => {
+  // 1. Branch created by this call, then PR capability cannot be issued -> manual review with the branch name.
+  {
+    const h = await run();
+    const writeResult = await h.writer.write({ context: h.context, capability: h.capability, leaseGuard: h.guard,
+      executionSession: h.executionSession });
+    assert.ok(isVerifiedArtifactOnlyGitHubWriteResult(writeResult, h.capability));
+    h.capabilities.issueDraftPullRequestCapability = async () => null;
+    const result = await new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities).publish({ writeResult,
+      capability: h.capability, leaseGuard: h.guard, executionSession: h.executionSession });
+    assert.deepEqual(result, { kind: "manual_review", code: "lease_lost_after_write",
+      branchName: deriveRemediationBranchName(h.capability) });
+    assert.deepEqual(h.stats(), { branchPosts: 1, prPosts: 0, closePosts: 0 });
+  }
+
+  // 2. Branch created by this call, PR capability issued but its client is unavailable -> manual review.
+  {
+    const h = await run();
+    const writeResult = await h.writer.write({ context: h.context, capability: h.capability, leaseGuard: h.guard,
+      executionSession: h.executionSession });
+    assert.ok(isVerifiedArtifactOnlyGitHubWriteResult(writeResult, h.capability));
+    h.capabilities.pullRequestClientFor = () => null;
+    const result = await new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities).publish({ writeResult,
+      capability: h.capability, leaseGuard: h.guard, executionSession: h.executionSession });
+    assert.deepEqual(result, { kind: "manual_review", code: "lease_lost_after_write",
+      branchName: deriveRemediationBranchName(h.capability) });
+    assert.deepEqual(h.stats(), { branchPosts: 1, prPosts: 0, closePosts: 0 });
+  }
+
+  // 3. Exact pre-existing branch (no mutation in this call) keeps the existing failed classification.
+  {
+    const h = await run();
+    const writeResult = await h.writer.write({ context: h.context, capability: h.capability, leaseGuard: h.guard,
+      executionSession: h.executionSession });
+    assert.ok(isVerifiedArtifactOnlyGitHubWriteResult(writeResult, h.capability));
+    h.seedBranch(deriveRemediationBranchName(h.capability), commitSha);
+    h.capabilities.issueDraftPullRequestCapability = async () => null;
+    const result = await new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities).publish({ writeResult,
+      capability: h.capability, leaseGuard: h.guard, executionSession: h.executionSession });
+    assert.deepEqual(result, { kind: "failed", code: "github_request_failed" });
+    assert.deepEqual(h.stats(), { branchPosts: 0, prPosts: 0, closePosts: 0 });
+  }
+});
+
+async function runWithClock(leaseMs: number,
+  onPrepare: (call: number, clock: { value: number }, h: ReturnType<typeof setup>) => void) {
+  const clock = { value: Date.now() };
+  const start = clock.value;
+  const h = setup({ now: () => clock.value });
+  h.db.remediation.leaseExpiresAt = new Date(start + leaseMs);
+  const capability = await h.capabilities.issue(lease);
+  assert.ok(capability);
+  const context = await h.contexts.prepare(lease);
+  assert.ok(context);
+  const executionSession = await h.persistence.start(lease, context);
+  assert.ok(executionSession);
+  const guard = h.capabilities.leaseGuardFor(capability);
+  assert.ok(guard);
+  // From here on, every persisted-state read (one per lease check / GitHub request) simulates elapsed time.
+  const original = h.contexts.prepare.bind(h.contexts);
+  let calls = 0;
+  h.contexts.prepare = async (value) => { calls++; onPrepare(calls, clock, h); return original(value); };
+  return { h, clock, start, capability, context, executionSession, guard, prepareCalls: () => calls,
+    writer: new ArtifactOnlyGitHubWriter(h.capabilities, () => clock.value),
+    publisher: new ArtifactOnlyGitHubDraftPrPublisher(h.capabilities, () => clock.value) };
+}
+
+test("writer and draft PR publisher outlive the initial lease across valid renewals, bounded by token expiry", async () => {
+  const leaseMs = 3_000;
+  const r = await runWithClock(leaseMs, (_call, clock, h) => {
+    clock.value += 500;
+    h.db.remediation.leaseExpiresAt = new Date(clock.value + leaseMs); // worker heartbeat renewal
+  });
+  const tokenExpiry = r.start + 60_000;
+  const writeResult = await r.writer.write({ context: r.context, capability: r.capability, leaseGuard: r.guard,
+    executionSession: r.executionSession });
+  assert.equal(writeResult.kind, "committed", JSON.stringify(writeResult));
+  assert.ok(r.clock.value - r.start > leaseMs, "write must have outlived the initial lease");
+  assert.ok(isVerifiedArtifactOnlyGitHubWriteResult(writeResult, r.capability));
+
+  const callsBeforePublish = r.prepareCalls();
+  const publishResult = await r.publisher.publish({ writeResult, capability: r.capability, leaseGuard: r.guard,
+    executionSession: r.executionSession });
+  assert.equal(publishResult.kind, "draft_pull_request", JSON.stringify(publishResult));
+  assert.ok(r.prepareCalls() - callsBeforePublish >= 2, "publisher must have survived multiple renewals");
+  const deadline = r.h.capabilities.currentDeadlineFor(r.capability);
+  assert.ok(deadline !== null && deadline > r.clock.value && deadline <= tokenExpiry);
+  assert.ok(r.clock.value < tokenExpiry);
+});
+
+test("execution terminates before any mutation when the lease expires, is revoked, or worker identity changes", async () => {
+  const scenarios: Array<[string, (call: number, clock: { value: number }, h: ReturnType<typeof setup>) => void]> = [
+    ["expired without renewal", (_call, clock) => { clock.value += 1_000; }],
+    ["revoked", (call, _clock, h) => { if (call === 3) h.capabilities.invalidateLease(lease.id); }],
+    ["changed workerId", (call, _clock, h) => { if (call === 3) h.db.remediation.workerId = "worker-other"; }],
+    ["changed leaseToken", (call, _clock, h) => {
+      if (call === 3) h.db.remediation.leaseToken = "ffffffff-ffff-4fff-8fff-ffffffffffff"; }]
+  ];
+  for (const [name, onPrepare] of scenarios) {
+    const r = await runWithClock(3_000, onPrepare);
+    const result = await r.writer.write({ context: r.context, capability: r.capability, leaseGuard: r.guard,
+      executionSession: r.executionSession });
+    assert.deepEqual(result, { kind: "failed", code: "lease_lost" }, name);
+    assert.equal(r.h.calls.some((call) => call.startsWith("POST ")), false, `${name}: no GitHub mutation`);
+    assert.equal(r.h.capabilities.currentDeadlineFor(r.capability), null, `${name}: capability no longer usable`);
+  }
+});
+
+test("commit verification reuses the already-verified tree without repeating flattenTree after commit", async () => {
+  const h = setup();
+  const capability = await h.capabilities.issue(lease);
+  assert.ok(capability);
+  const context = await h.contexts.prepare(lease);
+  assert.ok(context);
+  const executionSession = await h.persistence.start(lease, context);
+  assert.ok(executionSession);
+  const guard = h.capabilities.leaseGuardFor(capability);
+  assert.ok(guard);
+  const writer = new ArtifactOnlyGitHubWriter(h.capabilities);
+  const result = await writer.write({ context, capability, leaseGuard: guard, executionSession });
+  assert.equal(result.kind, "committed");
+  const commitPostIndex = h.calls.findIndex((call) => call.startsWith("POST ") && call.endsWith("/git/commits"));
+  assert.ok(commitPostIndex >= 0);
+  const treeReadsAfterCommit = h.calls.slice(commitPostIndex + 1).filter((call) => call.includes("/git/trees/"));
+  assert.deepEqual(treeReadsAfterCommit, []);
 });

@@ -18,7 +18,7 @@ export class ProjectGitHubBindingService {
       const fresh=await this.authorize(input,"organization:integrations:manage",tx);
       if(fresh.installation.githubInstallationId!==context.installation.githubInstallationId)throw new ProjectGitHubBindingError("conflict");
       const binding=await tx.projectGitHubRepository.create({data:{tenantId:input.tenantId,organizationId:input.organizationId,projectId:input.projectId,installationRecordId:input.installationRecordId,githubRepositoryId:BigInt(repo.id),ownerLogin:repo.owner,repositoryName:repo.name,connectedByIdentityUserId:input.identityUserId,status:"active"},select:{id:true,tenantId:true,organizationId:true,projectId:true,installationRecordId:true,githubRepositoryId:true,ownerLogin:true,repositoryName:true,status:true,createdAt:true}});
-      await tx.organizationAuditEvent.create({data:{organizationId:input.organizationId,tenantId:input.tenantId,projectId:input.projectId,actorType:"user",actorUserId:input.identityUserId,action:"GITHUB_REPOSITORY_BOUND",targetType:"project_github_repository",targetId:binding.id,metadata:{projectId:input.projectId,installationRecordId:input.installationRecordId,repositoryId:repo.id,owner:repo.owner,name:repo.name} as Prisma.InputJsonValue}});
+      await tx.organizationAuditEvent.create({data:{organizationId:input.organizationId,tenantId:input.tenantId,projectId:input.projectId,actorType:"user",actorUserId:input.identityUserId,action:"GITHUB_REPOSITORY_BOUND",targetType:"project_github_repository",targetId:binding.id,metadata:{projectId:input.projectId,installationRecordId:input.installationRecordId,repositoryId:repo.id,owner:repo.owner,name:repo.name} as Prisma.InputJsonValue},select:{id:true}});
       return binding;
     },{isolationLevel:Prisma.TransactionIsolationLevel.Serializable});}catch(e){if(e instanceof ProjectGitHubBindingError)throw e;if(isConflict(e))throw new ProjectGitHubBindingError("conflict");throw e;}
   }
@@ -57,9 +57,9 @@ export class ProjectGitHubBindingService {
           actorType:"user",actorUserId:input.identityUserId,action:"REMEDIATION_PROPOSAL_INVALIDATED",
           targetType:"remediation",targetId:proposal.id,
           metadata:{reason:"repository_binding_disconnected",repositoryBindingId:row.id,planHash:proposal.plan_hash} as Prisma.InputJsonValue
-        }});
+        },select:{id:true}});
       }
-      await tx.organizationAuditEvent.create({data:{organizationId:input.organizationId,tenantId:input.tenantId,projectId:input.projectId,actorType:"user",actorUserId:input.identityUserId,action:"GITHUB_REPOSITORY_DISCONNECTED",targetType:"project_github_repository",targetId:row.id,metadata:{repositoryId:String(row.githubRepositoryId),owner:row.ownerLogin,name:row.repositoryName} as Prisma.InputJsonValue}});
+      await tx.organizationAuditEvent.create({data:{organizationId:input.organizationId,tenantId:input.tenantId,projectId:input.projectId,actorType:"user",actorUserId:input.identityUserId,action:"GITHUB_REPOSITORY_DISCONNECTED",targetType:"project_github_repository",targetId:row.id,metadata:{repositoryId:String(row.githubRepositoryId),owner:row.ownerLogin,name:row.repositoryName} as Prisma.InputJsonValue},select:{id:true}});
       return{id:row.id,status:"disconnected" as const};
     },{isolationLevel:Prisma.TransactionIsolationLevel.Serializable});}catch(e){if(e instanceof ProjectGitHubBindingError)throw e;if(isConflict(e))throw new ProjectGitHubBindingError("conflict");throw e;}
   }

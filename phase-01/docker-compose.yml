@@ -11,10 +11,18 @@ services:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_METRIC_EXPORT_INTERVAL_MS: "5000"
+      METRICS_CONFIG_PATH: /app/config/observability/metrics.yaml
+      HEALTH_CONFIG_PATH: /app/config/observability/health-checks.yaml
+      TRACING_CONFIG_PATH: /app/config/observability/tracing.yaml
+      LOKI_PUSH_URL: http://loki:3100/loki/api/v1/push
+    volumes:
+      - ./config/observability:/app/config/observability:ro
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3000"
     depends_on:
       otel-collector:
+        condition: service_started
+      loki:
         condition: service_started
     healthcheck:
       test:
@@ -22,7 +30,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "require('http').get('http://127.0.0.1:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+          "require('http').get('http://127.0.0.1:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))",
         ]
       interval: 10s
       timeout: 3s
@@ -54,13 +62,18 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/observability:/etc/prometheus/rules:ro
     ports:
       - "127.0.0.1:9090:9090"
     depends_on:
       otel-collector:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9090/-/ready || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q --spider http://127.0.0.1:9090/-/ready || exit 1",
+        ]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -74,6 +87,18 @@ services:
       - "127.0.0.1:16686:16686"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:16686/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  loki:
+    image: grafana/loki:2.9.8
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3100/ready || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 6

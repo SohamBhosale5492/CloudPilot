@@ -50,10 +50,19 @@ export interface DbHealthResult {
  * Checks whether PostgreSQL is reachable via Prisma.
  * If unreachable, returns an actionable message advising how to start PostgreSQL.
  */
-export async function checkDatabaseConnection(client?: PrismaClient): Promise<DbHealthResult> {
+export async function checkDatabaseConnection(client?: PrismaClient, timeoutMs = 2500): Promise<DbHealthResult> {
   const prisma = client ?? getPrismaClient();
   try {
-    await prisma.$queryRawUnsafe("SELECT 1;");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Database health check timed out after ${timeoutMs}ms.`)), timeoutMs);
+        timer.unref?.();
+      });
+      await Promise.race([prisma.$queryRawUnsafe("SELECT 1;"), timeoutPromise]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
     return { ok: true };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);

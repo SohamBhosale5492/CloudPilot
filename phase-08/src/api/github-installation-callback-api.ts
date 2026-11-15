@@ -29,8 +29,8 @@ export class GitHubInstallationCallbackApiRoutes implements AuthenticatedRouteEx
     catch { context.sendJson(400, { error: "Invalid JSON request body." }); return true; }
     if (!isRecord(body) || Object.keys(body).sort().join(",") !== "installationId,setupAction,state" ||
         typeof body.installationId !== "string" || !parseGitHubInstallationId(body.installationId) ||
-        !isValidGitHubConnectState(body.state) || body.setupAction !== "install") {
-      context.sendJson(400, { error: "Callback requires installationId, state, and supported setupAction 'install'." });
+        !isValidGitHubConnectState(body.state) || (body.setupAction !== "install" && body.setupAction !== "update")) {
+      context.sendJson(400, { error: "Callback requires installationId, state, and setupAction 'install' or 'update'." });
       return true;
     }
 

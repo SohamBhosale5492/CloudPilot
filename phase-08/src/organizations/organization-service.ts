@@ -136,7 +136,8 @@ export class PrismaOrganizationService {
             targetType: "organization",
             targetId: organization.id,
             metadata: { displayName } as Prisma.InputJsonValue
-          }
+          },
+          select: { id: true }
         });
         await tx.organizationAuditEvent.create({
           data: {
@@ -146,7 +147,8 @@ export class PrismaOrganizationService {
             targetType: "organization_member",
             targetId: `${organization.id}:${input.creatorUserId}`,
             metadata: { role: "owner", userId: input.creatorUserId } as Prisma.InputJsonValue
-          }
+          },
+          select: { id: true }
         });
         return { organization, membership, replayed: false };
       });

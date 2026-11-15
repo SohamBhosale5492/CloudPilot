@@ -103,7 +103,7 @@ function setup(options: { mutate?: (s: ReturnType<typeof state>) => void; tokenM
       { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   const service = new GitHubExecutionCapabilityService(contexts, tokens, { now, clientOptions: { fetchImpl } });
-  return { service, persisted, calls: () => ({ tokenRequests, requests, invalidations }) };
+  return { service, persisted, contexts, calls: () => ({ tokenRequests, requests, invalidations }) };
 }
 
 test("issues an opaque capability only after persistence, token scope, and immutable GitHub identity agree", async () => {
@@ -244,5 +244,337 @@ test("binding, organization, identity, and installation invalidation revoke capa
     invalidate(h.service);
     assert.equal(h.service.clientFor(capability), null);
     assert.equal(h.calls().invalidations, 1);
+  }
+});
+
+test("accepts monotonic lease heartbeat renewals while keeping capability expiry bounded by installation token expiry", async () => {
+  let currentNow = 1_000_000;
+  const h = setup({
+    now: () => currentNow,
+    mutate: (s) => { s.remediation.leaseExpiresAt = new Date(currentNow + 30_000); },
+    tokenMutate: (t) => ({ ...t, expiresAt: new Date(currentNow + 90_000).toISOString() })
+  });
+  const capability = await h.service.issue(lease);
+  assert.ok(capability);
+  const initialTokenExpiry = new Date(currentNow + 90_000).getTime();
+  assert.equal(new Date(capability.expiresAt).getTime(), currentNow + 30_000);
+
+  // First heartbeat renewal: extends lease to +60s
+  currentNow += 15_000;
+  h.persisted.remediation.leaseExpiresAt = new Date(currentNow + 45_000);
+  const client1 = h.service.clientFor(capability);
+  assert.ok(client1);
+  await client1.readReference(capability.repository, "main");
+
+  // Second consecutive renewal: extends lease past installation-token expiry (+150s),
+  // capability expiry must remain bounded by token expiry.
+  currentNow += 15_000;
+  h.persisted.remediation.leaseExpiresAt = new Date(currentNow + 150_000);
+  await client1.readReference(capability.repository, "main");
+  assert.ok(h.service.clientFor(capability));
+
+  // Once installation-token expiry is reached, capability is expired even if DB lease is still in the future.
+  currentNow = initialTokenExpiry;
+  assert.equal(h.service.clientFor(capability), null);
+});
+
+test("rejects shortened or expired lease renewals, changed workerId or leaseToken, and changed immutable scope", async () => {
+  // 1. Shortened lease renewal (monotonicity violation)
+  {
+    let currentNow = 2_000_000;
+    const h = setup({
+      now: () => currentNow,
+      mutate: (s) => { s.remediation.leaseExpiresAt = new Date(currentNow + 60_000); }
+    });
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    const client = h.service.clientFor(capability);
+    assert.ok(client);
+    currentNow += 5_000;
+    h.persisted.remediation.leaseExpiresAt = new Date(2_000_000 + 30_000);
+    await assert.rejects(client.readReference(capability.repository, "main"),
+      (error: unknown) => error instanceof ArtifactGitHubClientError && error.code === "invalid_token");
+    assert.equal(h.service.clientFor(capability), null);
+  }
+
+  // 2. Expired lease (leaseExpiresAt <= now)
+  {
+    let currentNow = 3_000_000;
+    const h = setup({
+      now: () => currentNow,
+      mutate: (s) => { s.remediation.leaseExpiresAt = new Date(currentNow + 30_000); }
+    });
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    const client = h.service.clientFor(capability);
+    assert.ok(client);
+    h.persisted.remediation.leaseExpiresAt = new Date(currentNow);
+    await assert.rejects(client.readReference(capability.repository, "main"),
+      (error: unknown) => error instanceof ArtifactGitHubClientError && error.code === "invalid_token");
+    assert.equal(h.service.clientFor(capability), null);
+  }
+
+  // 3. Changed workerId or leaseToken
+  for (const mutateField of [
+    (s: ReturnType<typeof state>) => { s.remediation.workerId = "worker-other"; },
+    (s: ReturnType<typeof state>) => { s.remediation.leaseToken = "00000000-0000-4000-8000-000000000000"; }
+  ]) {
+    const h = setup();
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    const client = h.service.clientFor(capability);
+    assert.ok(client);
+    mutateField(h.persisted);
+    await assert.rejects(client.readReference(capability.repository, "main"),
+      (error: unknown) => error instanceof ArtifactGitHubClientError && error.code === "invalid_token");
+    assert.equal(h.service.clientFor(capability), null);
+  }
+
+  // 4. Changed immutable scope (approvedArtifactHash / baseCommitSha)
+  {
+    const h = setup();
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    const client = h.service.clientFor(capability);
+    assert.ok(client);
+    const alteredArtifact = renderExecutionArtifact({
+      scope: { proposalId: lease.id, tenantId: lease.tenantId, organizationId: ids.organizationId, projectId: lease.projectId,
+        repositoryBindingId: ids.bindingId, githubRepositoryId: ids.repositoryId, installationRecordId: ids.installationRecordId, planHash },
+      finding,
+      snapshot: { immutableRepositoryId: ids.repositoryId, baseRef: "main", baseCommitSha: "c".repeat(40),
+        filePath: "config/observability/metrics.yaml", file: { content: null, contentBase64: null, blobSha: null,
+          mode: null, fileType: null, isRegularFile: true } },
+      createdAt: approvedAt
+    });
+    h.persisted.remediation.executionArtifact = structuredClone(alteredArtifact.artifact);
+    h.persisted.remediation.executionArtifactHash = alteredArtifact.artifactHash;
+    h.persisted.remediation.approvedArtifactHash = alteredArtifact.artifactHash;
+    await assert.rejects(client.readReference(capability.repository, "main"),
+      (error: unknown) => error instanceof ArtifactGitHubClientError && error.code === "invalid_token");
+    assert.equal(h.service.clientFor(capability), null);
+  }
+});
+
+test("issue refreshes the initial capability expiry from the confirmed lease, bounded by installation-token expiry", async () => {
+  for (const extensionMs of [60_000, 200_000]) {
+    const start = 5_000_000;
+    let currentNow = start;
+    const h = setup({
+      now: () => currentNow,
+      mutate: (s) => { s.remediation.leaseExpiresAt = new Date(start + 30_000); },
+      tokenMutate: (t) => ({ ...t, expiresAt: new Date(start + 90_000).toISOString() })
+    });
+    const original = h.contexts.prepare.bind(h.contexts);
+    let extended = false;
+    h.contexts.prepare = async (value) => {
+      // Only the post-resolution confirmation read (after the repository fetch) observes the heartbeat renewal.
+      if (!extended && h.calls().requests >= 1) {
+        extended = true;
+        h.persisted.remediation.leaseExpiresAt = new Date(start + extensionMs);
+      }
+      return original(value);
+    };
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    assert.equal(extended, true);
+    currentNow = start + 45_000;
+    assert.ok(h.service.clientFor(capability), "confirmed renewal must extend the internal capability expiry");
+    if (extensionMs === 60_000) {
+      currentNow = start + 60_000;
+      assert.equal(h.service.clientFor(capability), null);
+    } else {
+      currentNow = start + 89_999;
+      assert.ok(h.service.clientFor(capability));
+      currentNow = start + 90_000;
+      assert.equal(h.service.clientFor(capability), null, "renewal can never exceed installation-token expiry");
+    }
+  }
+});
+
+test("an older in-flight lease snapshot cannot revoke a capability after a newer renewal was accepted", async () => {
+  const h = setup();
+  const capability = await h.service.issue(lease);
+  assert.ok(capability);
+  const guard = h.service.leaseGuardFor(capability);
+  assert.ok(guard);
+  const original = h.contexts.prepare.bind(h.contexts);
+  const base = h.persisted.remediation.leaseExpiresAt.getTime();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let markTaken!: () => void;
+  const taken = new Promise<void>((resolve) => { markTaken = resolve; });
+  let call = 0;
+  h.contexts.prepare = async (value) => {
+    call++;
+    if (call === 1) {
+      h.persisted.remediation.leaseExpiresAt = new Date(base + 15_000);
+      const older = await original(value);
+      markTaken();
+      await gate;
+      return older;
+    }
+    h.persisted.remediation.leaseExpiresAt = new Date(base + 30_000);
+    return original(value);
+  };
+  const olderCheck = guard.assertOwned();
+  await taken;
+  await guard.assertOwned();
+  release();
+  await olderCheck;
+  assert.ok(h.service.clientFor(capability), "superseded snapshot must not revoke");
+  assert.equal(h.calls().invalidations, 0);
+
+  // A read that starts after the accepted renewal and reports a shorter lease is still a shortening and fails closed.
+  h.contexts.prepare = async (value) => {
+    h.persisted.remediation.leaseExpiresAt = new Date(base + 15_000);
+    return original(value);
+  };
+  await assert.rejects(guard.assertOwned());
+  assert.equal(h.service.clientFor(capability), null);
+  assert.equal(h.calls().invalidations, 1);
+});
+
+test("a superseded lease snapshot with changed immutable scope still revokes the capability", async () => {
+  const h = setup();
+  const capability = await h.service.issue(lease);
+  assert.ok(capability);
+  const guard = h.service.leaseGuardFor(capability);
+  assert.ok(guard);
+  const original = h.contexts.prepare.bind(h.contexts);
+  const base = h.persisted.remediation.leaseExpiresAt.getTime();
+  const altered = renderExecutionArtifact({
+    scope: { proposalId: lease.id, tenantId: lease.tenantId, organizationId: ids.organizationId, projectId: lease.projectId,
+      repositoryBindingId: ids.bindingId, githubRepositoryId: ids.repositoryId, installationRecordId: ids.installationRecordId, planHash },
+    finding,
+    snapshot: { immutableRepositoryId: ids.repositoryId, baseRef: "main", baseCommitSha: "c".repeat(40),
+      filePath: "config/observability/metrics.yaml", file: { content: null, contentBase64: null, blobSha: null,
+        mode: null, fileType: null, isRegularFile: true } },
+    createdAt: approvedAt
+  });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let markTaken!: () => void;
+  const taken = new Promise<void>((resolve) => { markTaken = resolve; });
+  let call = 0;
+  h.contexts.prepare = async (value) => {
+    call++;
+    if (call === 1) {
+      const saved = { ...h.persisted.remediation };
+      h.persisted.remediation.executionArtifact = structuredClone(altered.artifact);
+      h.persisted.remediation.executionArtifactHash = altered.artifactHash;
+      h.persisted.remediation.approvedArtifactHash = altered.artifactHash;
+      h.persisted.remediation.leaseExpiresAt = new Date(base + 15_000);
+      const older = await original(value);
+      Object.assign(h.persisted.remediation, saved);
+      markTaken();
+      await gate;
+      return older;
+    }
+    h.persisted.remediation.leaseExpiresAt = new Date(base + 30_000);
+    return original(value);
+  };
+  const olderCheck = guard.assertOwned();
+  await taken;
+  await guard.assertOwned();
+  release();
+  await assert.rejects(olderCheck);
+  assert.equal(h.service.clientFor(capability), null);
+});
+
+test("currentDeadlineFor follows accepted renewals, never moves backwards, and never exceeds token expiry", async () => {
+  const start = 7_000_000;
+  let currentNow = start;
+  const h = setup({
+    now: () => currentNow,
+    mutate: (s) => { s.remediation.leaseExpiresAt = new Date(start + 30_000); },
+    tokenMutate: (t) => ({ ...t, expiresAt: new Date(start + 90_000).toISOString() })
+  });
+  const capability = await h.service.issue(lease);
+  assert.ok(capability);
+  const guard = h.service.leaseGuardFor(capability);
+  assert.ok(guard);
+  assert.equal(h.service.currentDeadlineFor(capability), start + 30_000);
+  assert.equal(h.service.currentDeadlineFor({ ...capability }), null, "copied capabilities have no deadline");
+
+  currentNow = start + 20_000;
+  h.persisted.remediation.leaseExpiresAt = new Date(start + 50_000);
+  await guard.assertOwned();
+  assert.equal(h.service.currentDeadlineFor(capability), start + 50_000);
+
+  // Out-of-order: an older read resolving after a newer accepted renewal cannot move the deadline backwards.
+  const original = h.contexts.prepare.bind(h.contexts);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let markTaken!: () => void;
+  const taken = new Promise<void>((resolve) => { markTaken = resolve; });
+  let call = 0;
+  h.contexts.prepare = async (value) => {
+    call++;
+    if (call === 1) {
+      h.persisted.remediation.leaseExpiresAt = new Date(start + 55_000);
+      const older = await original(value);
+      markTaken();
+      await gate;
+      return older;
+    }
+    h.persisted.remediation.leaseExpiresAt = new Date(start + 70_000);
+    return original(value);
+  };
+  const olderCheck = guard.assertOwned();
+  await taken;
+  await guard.assertOwned();
+  assert.equal(h.service.currentDeadlineFor(capability), start + 70_000);
+  release();
+  await olderCheck;
+  assert.equal(h.service.currentDeadlineFor(capability), start + 70_000, "deadline never moves backwards");
+
+  // No renewal can extend authorization beyond installation-token expiry.
+  h.contexts.prepare = original;
+  h.persisted.remediation.leaseExpiresAt = new Date(start + 500_000);
+  await guard.assertOwned();
+  assert.equal(h.service.currentDeadlineFor(capability), start + 90_000);
+  currentNow = start + 90_000;
+  assert.equal(h.service.currentDeadlineFor(capability), null);
+  await assert.rejects(guard.assertOwned());
+});
+
+test("watchDeadline fires once on revocation or deadline expiry and is disposable", async () => {
+  // Revocation fires immediately, exactly once.
+  {
+    const h = setup();
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    let fired = 0;
+    const stop = h.service.watchDeadline(capability, () => { fired++; });
+    h.service.invalidateLease(lease.id);
+    h.service.invalidateLease(lease.id);
+    assert.equal(fired, 1);
+    stop();
+  }
+  // Deadline expiry fires via a single re-armed timer (real clock, short lease).
+  {
+    const h = setup({ mutate: (s) => { s.remediation.leaseExpiresAt = new Date(Date.now() + 150); } });
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    let fired = 0;
+    const stop = h.service.watchDeadline(capability, () => { fired++; });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(fired, 1);
+    assert.equal(h.service.currentDeadlineFor(capability), null);
+    stop();
+  }
+  // A disposed watcher never fires, and forged capabilities fire immediately (fail closed).
+  {
+    const h = setup();
+    const capability = await h.service.issue(lease);
+    assert.ok(capability);
+    let fired = 0;
+    const stop = h.service.watchDeadline(capability, () => { fired++; });
+    stop();
+    h.service.invalidateLease(lease.id);
+    assert.equal(fired, 0);
+    let forgedFired = 0;
+    h.service.watchDeadline({ ...capability }, () => { forgedFired++; });
+    assert.equal(forgedFired, 1);
   }
 });
